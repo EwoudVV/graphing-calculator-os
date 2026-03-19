@@ -1,130 +1,115 @@
 /*
- * the kernel main function
+ * kernel.c - GraphCalcOS kernel
  *
- * the first C code that runs in the os
- * running directly on the hardware, bare metal
- *
- * to print text, write directly to the VGA text buffer in video memory
+ * NOW IN GRAPHICS MODE!
+ * instead of writing characters to 0xB8000 (text buffer),
+ * we write individual pixels to 0xA0000 (graphics framebuffer).
+ * every single thing on screen - text, lines, graphs - is drawn
+ * pixel by pixel by us.
  */
 
 #include <stdint.h>
 #include "keyboard.h"
+#include "font.h"   /* includes vga.h and ports.h */
 
-/* the VGA text buffer is at a physical memory address
-   the gpu constantly reads from this and displays it on screen
-   each character takes 2 bytes: [ASCII char] [color attribute]
-   the screen is 80 columns x 25 rows = 2000 characters = 4000 bytes */
-#define VGA_BUFFER 0xB8000
-#define VGA_WIDTH  80
-#define VGA_HEIGHT 25
-
-/* color attribute byte: high nibble = background, low nibble = foreground
-   0x0F = black background (0) + white foreground (F) */
-#define COLOR_WHITE_ON_BLACK 0x0F
-#define COLOR_GREEN_ON_BLACK 0x0A
-#define COLOR_CYAN_ON_BLACK  0x0B
-
-// writes a string to the VGA text buffer at a given row
-void print_at(const char *str, int row, int col, uint8_t color) {
-    /* cast the VGA buffer address to a pointer it can write to, use volatile because this memory is read by the video hardware. */
-    volatile uint16_t *vga = (volatile uint16_t *)VGA_BUFFER;
-
-    /* calculate the position in the buffer
-       each row is 80 characters wide */
-    int pos = row * VGA_WIDTH + col;
-
-    // write each character
-    for (int i = 0; str[i] != '\0'; i++) {
-        /* put the ASCII char and color into one 16 bit value
-           low byte = character, high byte = color attribute */
-        vga[pos + i] = (uint16_t)str[i] | ((uint16_t)color << 8);
-    }
-}
-
-// clear the entire screen by filling it with spaces
-void clear_screen(void) {
-    volatile uint16_t *vga = (volatile uint16_t *)VGA_BUFFER;
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        vga[i] = (uint16_t)' ' | ((uint16_t)COLOR_WHITE_ON_BLACK << 8);
-    }
-}
-
-/*
- * move the hardware cursor (the blinking underscore)
+/* layout constants - where things go on screen
  *
- * the VGA controller has its own cursor that blinks automatically.
- * but it doesn't know where we're typing - we have to tell it!
- * we talk to it through ports 0x3D4 (command) and 0x3D5 (data).
- *
- * the cursor position is a single number (row * 80 + col),
- * but it's 16 bits and ports only send 8 bits at a time,
- * so we send the high byte first (register 14), then low byte (register 15)
+ * screen is 320x200 pixels. we split it into:
+ *   - top: title area
+ *   - middle: graph area (where graphs will be drawn)
+ *   - bottom: input bar (where you type equations)
  */
-void move_cursor(int row, int col) {
-    uint16_t pos = row * VGA_WIDTH + col;
+#define INPUT_BAR_Y     184   /* y position of the input bar */
+#define INPUT_TEXT_Y     188  /* y position of text inside the bar */
+#define INPUT_TEXT_X     24   /* x position of text (after "> ") */
+#define MAX_INPUT_LEN    34   /* max characters that fit in the input bar */
 
-    outb(0x3D4, 14);             /* tell VGA: "i'm sending the high byte" */
-    outb(0x3D5, (pos >> 8));     /* send upper 8 bits of position */
-    outb(0x3D4, 15);             /* tell VGA: "now the low byte" */
-    outb(0x3D5, (pos & 0xFF));   /* send lower 8 bits of position */
+/* draw the input bar at the bottom of the screen */
+void draw_input_bar(void) {
+    /* dark gray background bar */
+    vga_fill_rect(0, INPUT_BAR_Y, SCREEN_WIDTH, 16, COLOR_DARK_GRAY);
+
+    /* draw the prompt "> " */
+    draw_string(8, INPUT_TEXT_Y, ">", COLOR_WHITE);
 }
 
-/* put a single character on screen at a position */
-void put_char_at(char c, int row, int col, uint8_t color) {
-    volatile uint16_t *vga = (volatile uint16_t *)VGA_BUFFER;
-    int pos = row * VGA_WIDTH + col;
-    vga[pos] = (uint16_t)c | ((uint16_t)color << 8);
+/* draw a simple blinking cursor (just a vertical line) */
+void draw_cursor(int char_pos, uint8_t color) {
+    int x = INPUT_TEXT_X + char_pos * FONT_WIDTH;
+    vga_draw_vline(x, INPUT_TEXT_Y, FONT_HEIGHT, color);
+}
+
+/* clear the text area of the input bar (not the prompt) */
+void clear_input_text(void) {
+    vga_fill_rect(INPUT_TEXT_X, INPUT_TEXT_Y, SCREEN_WIDTH - INPUT_TEXT_X - 4, FONT_HEIGHT, COLOR_DARK_GRAY);
 }
 
 // kernel entry point, called from boot.asm
 void kmain(void) {
-    clear_screen();
+    /* === SWITCH TO GRAPHICS MODE === */
+    vga_init_graphics();
+    vga_clear(COLOR_BLACK);
 
-    print_at("Hello World!", 1, 2, COLOR_GREEN_ON_BLACK);
-    print_at("This is a graphing calculator operating system", 3, 2, COLOR_WHITE_ON_BLACK);
-    print_at("Built from scratch! Coded by EVV (me!!)", 5, 2, COLOR_CYAN_ON_BLACK);
+    /* draw the title */
+    draw_string(8, 4, "GraphCalcOS", COLOR_LIGHT_GREEN);
+    draw_string(8, 16, "type something and press enter!", COLOR_LIGHT_GRAY);
 
-    /* input line: where the user types */
-    print_at("> ", 8, 2, COLOR_WHITE_ON_BLACK);
-    int cursor_col = 4;  /* start after "> " */
-    move_cursor(8, cursor_col);
+    /* draw a horizontal line to separate title from graph area */
+    vga_draw_hline(0, 28, SCREEN_WIDTH, COLOR_DARK_GRAY);
 
-    /*
-     * the main loop! this is the "kernel loop" that runs forever.
-     * every OS has one of these - it just keeps checking for input
-     * and responding to it. without this loop, the OS would
-     * print its messages and then... stop. dead.
-     *
-     * right now we "poll" the keyboard (keep asking "any keys?")
-     * later we'll use interrupts so the CPU doesn't waste cycles
-     */
+    /* draw the input bar */
+    draw_input_bar();
+
+    /* input state */
+    char input_buf[MAX_INPUT_LEN + 1];  /* +1 for null terminator */
+    int input_len = 0;
+    input_buf[0] = '\0';
+
+    draw_cursor(0, COLOR_WHITE);
+
+    /* main kernel loop - poll keyboard and handle input */
     while (1) {
         char c = keyboard_read_char();
 
-        if (c == 0) {
-            /* no key pressed, keep looping */
-            continue;
-        }
+        if (c == 0) continue;
 
         if (c == '\b') {
-            /* backspace: move cursor back and erase the character */
-            if (cursor_col > 4) {
-                cursor_col--;
-                put_char_at(' ', 8, cursor_col, COLOR_WHITE_ON_BLACK);
-                move_cursor(8, cursor_col);
+            /* backspace */
+            if (input_len > 0) {
+                /* erase cursor */
+                draw_cursor(input_len, COLOR_DARK_GRAY);
+                /* remove last character */
+                input_len--;
+                input_buf[input_len] = '\0';
+                /* redraw: clear text area and rewrite the string */
+                clear_input_text();
+                draw_string(INPUT_TEXT_X, INPUT_TEXT_Y, input_buf, COLOR_WHITE);
+                /* draw cursor at new position */
+                draw_cursor(input_len, COLOR_WHITE);
             }
         } else if (c == '\n') {
-            /* enter key: for now, just clear the input line */
-            for (int i = 4; i < VGA_WIDTH; i++) {
-                put_char_at(' ', 8, i, COLOR_WHITE_ON_BLACK);
-            }
-            cursor_col = 4;
-            move_cursor(8, cursor_col);
-        } else if (cursor_col < VGA_WIDTH - 1) {
-            /* regular character: put it on screen and advance cursor */
-            put_char_at(c, 8, cursor_col, COLOR_GREEN_ON_BLACK);
-            cursor_col++;
-            move_cursor(8, cursor_col);
+            /* enter: for now, just show what was typed above the input bar */
+            /* clear the display area */
+            vga_fill_rect(0, 32, SCREEN_WIDTH, 148, COLOR_BLACK);
+            draw_string(8, 40, "you typed:", COLOR_LIGHT_GRAY);
+            draw_string(8, 56, input_buf, COLOR_LIGHT_GREEN);
+
+            /* clear input */
+            draw_cursor(input_len, COLOR_DARK_GRAY);
+            input_len = 0;
+            input_buf[0] = '\0';
+            clear_input_text();
+            draw_cursor(0, COLOR_WHITE);
+        } else if (input_len < MAX_INPUT_LEN) {
+            /* regular character - add to buffer and display */
+            draw_cursor(input_len, COLOR_DARK_GRAY);  /* erase old cursor */
+            input_buf[input_len] = c;
+            input_len++;
+            input_buf[input_len] = '\0';
+            /* draw the new character */
+            draw_char(INPUT_TEXT_X + (input_len - 1) * FONT_WIDTH, INPUT_TEXT_Y, c, COLOR_WHITE);
+            /* draw cursor at new position */
+            draw_cursor(input_len, COLOR_WHITE);
         }
     }
 }
