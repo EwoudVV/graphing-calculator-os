@@ -106,8 +106,65 @@ static uint32_t pci_read(uint8_t bus, uint8_t device, uint8_t func, uint8_t offs
 #define COLOR_AXIS          0x00707070
 #define COLOR_TICK           0x00A0A0A0
 
-/* the framebuffer pointer - set during init */
+/* the framebuffer pointer (actual screen) - set during init */
 static volatile uint32_t *framebuffer;
+
+/*
+ * DOUBLE BUFFERING
+ *
+ * the problem: when we draw directly to the framebuffer (screen),
+ * the user sees every pixel appear one by one. for panning/zooming
+ * this looks terrible - you see the old image get erased and the
+ * new one drawn progressively.
+ *
+ * the solution: draw to a hidden "back buffer" in regular RAM,
+ * then copy the entire buffer to the screen in one fast operation.
+ * the user sees an instant update instead of progressive drawing.
+ *
+ * this is the same technique used by every game and OS:
+ *   1. draw the next frame to the back buffer (invisible)
+ *   2. "flip" - copy back buffer to screen (instant)
+ *
+ * we use a pointer called draw_target that all drawing functions
+ * write to. by switching this pointer, we control WHERE pixels go:
+ *   draw_target = framebuffer   -> draws directly to screen (visible)
+ *   draw_target = back_buffer   -> draws to hidden buffer (invisible)
+ */
+static uint32_t back_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
+static volatile uint32_t *draw_target;
+
+/* switch drawing to the hidden back buffer */
+static void vga_use_backbuffer(void) {
+    draw_target = (volatile uint32_t *)back_buffer;
+}
+
+/* switch drawing directly to the screen */
+static void vga_use_screen(void) {
+    draw_target = framebuffer;
+}
+
+/*
+ * copy the entire back buffer to the screen in one go ("flip").
+ *
+ * uses "rep movsl" - an x86 instruction that copies 32-bit words
+ * in a tight hardware-optimized loop. the CPU knows this pattern
+ * and can burst data across the memory bus much faster than a
+ * C for-loop that does individual writes.
+ *
+ *   rep    = "repeat ECX times"
+ *   movsl  = "move string long" (copy 4 bytes from ESI to EDI, advance both)
+ */
+static void vga_flush(void) {
+    int count = SCREEN_WIDTH * SCREEN_HEIGHT;
+    const uint32_t *src = (const uint32_t *)back_buffer;
+    volatile uint32_t *dest = framebuffer;
+    __asm__ volatile (
+        "rep movsl"
+        : "+D"(dest), "+S"(src), "+c"(count)
+        :
+        : "memory"
+    );
+}
 
 /*
  * initialize 640x480x32 graphics mode using Bochs VBE.
@@ -128,6 +185,9 @@ static void vga_init_graphics(void) {
     /* mask off the lower 4 bits (they're flags, not part of the address) */
     framebuffer = (volatile uint32_t *)(bar0 & 0xFFFFFFF0);
 
+    /* default: draw directly to screen */
+    draw_target = framebuffer;
+
     /*
      * step 2: set the display mode.
      * disable VBE first, change settings, then re-enable.
@@ -147,36 +207,82 @@ static void vga_init_graphics(void) {
  */
 static inline void vga_put_pixel(int x, int y, uint32_t color) {
     if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT) return;
-    framebuffer[y * SCREEN_WIDTH + x] = color;
+    draw_target[y * SCREEN_WIDTH + x] = color;
 }
 
-/* clear the entire screen to one color */
+/*
+ * clear the entire screen to one color.
+ *
+ * uses "rep stosl" - fills memory with a 32-bit value in a
+ * hardware-optimized loop. way faster than writing one pixel at a time.
+ *
+ *   rep    = "repeat ECX times"
+ *   stosl  = "store string long" (write EAX to EDI, advance EDI)
+ */
 static void vga_clear(uint32_t color) {
-    for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
-        framebuffer[i] = color;
-    }
+    int count = SCREEN_WIDTH * SCREEN_HEIGHT;
+    volatile uint32_t *dest = draw_target;
+    __asm__ volatile (
+        "rep stosl"
+        : "+D"(dest), "+c"(count)
+        : "a"(color)
+        : "memory"
+    );
 }
 
-/* draw a horizontal line */
+/* draw a horizontal line (uses rep stosl for speed) */
 static void vga_draw_hline(int x, int y, int width, uint32_t color) {
-    for (int i = 0; i < width; i++) {
-        vga_put_pixel(x + i, y, color);
-    }
+    if (y < 0 || y >= SCREEN_HEIGHT) return;
+    int x1 = x < 0 ? 0 : x;
+    int x2 = (x + width) > SCREEN_WIDTH ? SCREEN_WIDTH : (x + width);
+    int count = x2 - x1;
+    if (count <= 0) return;
+    volatile uint32_t *dest = &draw_target[y * SCREEN_WIDTH + x1];
+    __asm__ volatile (
+        "rep stosl"
+        : "+D"(dest), "+c"(count)
+        : "a"(color)
+        : "memory"
+    );
 }
 
 /* draw a vertical line */
 static void vga_draw_vline(int x, int y, int height, uint32_t color) {
-    for (int i = 0; i < height; i++) {
-        vga_put_pixel(x, y + i, color);
+    if (x < 0 || x >= SCREEN_WIDTH) return;
+    int y1 = y < 0 ? 0 : y;
+    int y2 = (y + height) > SCREEN_HEIGHT ? SCREEN_HEIGHT : (y + height);
+    for (int row = y1; row < y2; row++) {
+        draw_target[row * SCREEN_WIDTH + x] = color;
     }
 }
 
-/* draw a filled rectangle */
+/*
+ * draw a filled rectangle.
+ *
+ * OLD: called vga_put_pixel per pixel = 4 bounds checks per pixel.
+ *      for a 500x432 rect that's 864,000 comparisons!
+ *
+ * NEW: clamp bounds ONCE, then fill each row with rep stosl.
+ *      zero per-pixel overhead.
+ */
 static void vga_fill_rect(int x, int y, int w, int h, uint32_t color) {
-    for (int row = 0; row < h; row++) {
-        for (int col = 0; col < w; col++) {
-            vga_put_pixel(x + col, y + row, color);
-        }
+    /* clamp to screen bounds once */
+    int x1 = x < 0 ? 0 : x;
+    int y1 = y < 0 ? 0 : y;
+    int x2 = (x + w) > SCREEN_WIDTH ? SCREEN_WIDTH : (x + w);
+    int y2 = (y + h) > SCREEN_HEIGHT ? SCREEN_HEIGHT : (y + h);
+    int row_width = x2 - x1;
+    if (row_width <= 0) return;
+
+    for (int row = y1; row < y2; row++) {
+        volatile uint32_t *dest = &draw_target[row * SCREEN_WIDTH + x1];
+        int count = row_width;
+        __asm__ volatile (
+            "rep stosl"
+            : "+D"(dest), "+c"(count)
+            : "a"(color)
+            : "memory"
+        );
     }
 }
 

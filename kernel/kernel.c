@@ -55,7 +55,22 @@
 #define MAX_EQUATIONS    6
 #define MAX_EQ_LEN       50
 
-static char equations[MAX_EQUATIONS][MAX_EQ_LEN + 1];
+/*
+ * each equation slot stores:
+ *   - the text (for display in the panel)
+ *   - whether it's implicit (has y and =)
+ *   - compiled bytecode (for fast evaluation during pan/zoom)
+ *     implicit equations store left and right sides separately
+ */
+typedef struct {
+    char text[MAX_EQ_LEN + 1];
+    int is_implicit;
+    compiled_eq compiled;      /* for explicit: y = f(x) */
+    compiled_eq comp_left;     /* for implicit: left side of = */
+    compiled_eq comp_right;    /* for implicit: right side of = */
+} equation_slot;
+
+static equation_slot equations[MAX_EQUATIONS];
 static int eq_count = 0;
 
 /* graph colors for each equation slot */
@@ -190,10 +205,10 @@ static void draw_graph_area(void) {
 }
 
 /*
- * plot an explicit equation (y = f(x) style)
- * walks pixel by pixel left to right, evaluates, draws.
+ * SLOW plot (string parsing) - used for the initial animation.
+ * draws directly to screen so you see it appear.
  */
-static void plot_explicit(const char *equation, uint32_t color) {
+static void plot_explicit_slow(const char *equation, uint32_t color) {
     int prev_py = -1;
 
     for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px++) {
@@ -206,10 +221,8 @@ static void plot_explicit(const char *equation, uint32_t color) {
 
         if (py >= GRAPH_TOP && py <= GRAPH_BOTTOM) {
             if (prev_py >= GRAPH_TOP && prev_py <= GRAPH_BOTTOM && prev_py != -1) {
-                /* connect to previous point to fill gaps in steep curves */
                 int y_start = (prev_py < py) ? prev_py : py;
                 int y_end = (prev_py < py) ? py : prev_py;
-                /* limit the gap fill so discontinuities don't draw huge lines */
                 if (y_end - y_start < GRAPH_HEIGHT / 2) {
                     for (int y = y_start; y <= y_end; y++) {
                         if (y >= GRAPH_TOP && y <= GRAPH_BOTTOM)
@@ -224,42 +237,20 @@ static void plot_explicit(const char *equation, uint32_t color) {
     }
 }
 
-/*
- * plot an implicit equation (F(x,y) = 0 style)
- *
- * this is the COOL algorithm for drawing circles and other curves
- * that aren't functions (multiple y values per x).
- *
- * the idea: evaluate F(x,y) = left_side - right_side at every pixel.
- * wherever F changes sign between adjacent pixels, the curve crosses
- * through there - so we draw a pixel.
- *
- * it's like finding where the ground goes from above sea level to below:
- * the coastline is where it crosses zero.
- */
-static void plot_implicit(const char *equation, uint32_t color) {
-    /* step size = 1 pixel in math coordinates */
+static void plot_implicit_slow(const char *equation, uint32_t color) {
     float dx = 1.0f / (float)grid_scale;
     float dy = 1.0f / (float)grid_scale;
 
-    /* evaluate every pixel in the graph area */
     for (int py = GRAPH_TOP; py <= GRAPH_BOTTOM; py += 1) {
         float my = (float)(origin_y - py) / (float)grid_scale;
-
         for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px += 1) {
             float mx = (float)(px - origin_x) / (float)grid_scale;
-
-            /* evaluate F at this point and its neighbors */
             float val   = evaluate_implicit(equation, mx, my);
             float val_r = evaluate_implicit(equation, mx + dx, my);
             float val_d = evaluate_implicit(equation, mx, my - dy);
-
             if (is_nan(val) || is_nan(val_r) || is_nan(val_d)) continue;
-
-            /* if the sign changes, the curve passes through here! */
             if ((val >= 0) != (val_r >= 0) || (val >= 0) != (val_d >= 0)) {
                 vga_put_pixel(px, py, color);
-                /* draw a slightly thicker line for visibility */
                 vga_put_pixel(px + 1, py, color);
                 vga_put_pixel(px, py + 1, color);
             }
@@ -267,12 +258,77 @@ static void plot_implicit(const char *equation, uint32_t color) {
     }
 }
 
-/* plot an equation (auto-detects explicit vs implicit) */
-static void plot_equation(const char *equation, uint32_t color) {
+/* initial plot with animation (string parsing, draws to screen) */
+static void plot_equation_animated(const char *equation, uint32_t color) {
     if (is_implicit_equation(equation)) {
-        plot_implicit(equation, color);
+        plot_implicit_slow(equation, color);
     } else {
-        plot_explicit(equation, color);
+        plot_explicit_slow(equation, color);
+    }
+}
+
+/*
+ * FAST plot (compiled bytecode) - used during pan/zoom.
+ * runs the pre-compiled bytecode instead of re-parsing the string.
+ * MUCH faster because it's just a tight loop of stack operations.
+ */
+static void plot_explicit_fast(const equation_slot *eq, uint32_t color) {
+    int prev_py = -1;
+
+    for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px++) {
+        float math_x = (float)(px - origin_x) / (float)grid_scale;
+        float math_y = eval_compiled(&eq->compiled, math_x, 0.0f);
+
+        if (is_nan(math_y)) { prev_py = -1; continue; }
+
+        int py = origin_y - (int)(math_y * (float)grid_scale);
+
+        if (py >= GRAPH_TOP && py <= GRAPH_BOTTOM) {
+            if (prev_py >= GRAPH_TOP && prev_py <= GRAPH_BOTTOM && prev_py != -1) {
+                int y_start = (prev_py < py) ? prev_py : py;
+                int y_end = (prev_py < py) ? py : prev_py;
+                if (y_end - y_start < GRAPH_HEIGHT / 2) {
+                    for (int y = y_start; y <= y_end; y++) {
+                        if (y >= GRAPH_TOP && y <= GRAPH_BOTTOM)
+                            vga_put_pixel(px, y, color);
+                    }
+                }
+            } else {
+                vga_put_pixel(px, py, color);
+            }
+        }
+        prev_py = py;
+    }
+}
+
+static void plot_implicit_fast(const equation_slot *eq, uint32_t color) {
+    float dx = 1.0f / (float)grid_scale;
+    float dy = 1.0f / (float)grid_scale;
+
+    for (int py = GRAPH_TOP; py <= GRAPH_BOTTOM; py += 1) {
+        float my = (float)(origin_y - py) / (float)grid_scale;
+        for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px += 1) {
+            float mx = (float)(px - origin_x) / (float)grid_scale;
+            /* evaluate left - right using compiled bytecode */
+            float val   = eval_compiled(&eq->comp_left, mx, my) - eval_compiled(&eq->comp_right, mx, my);
+            float val_r = eval_compiled(&eq->comp_left, mx+dx, my) - eval_compiled(&eq->comp_right, mx+dx, my);
+            float val_d = eval_compiled(&eq->comp_left, mx, my-dy) - eval_compiled(&eq->comp_right, mx, my-dy);
+            if (is_nan(val) || is_nan(val_r) || is_nan(val_d)) continue;
+            if ((val >= 0) != (val_r >= 0) || (val >= 0) != (val_d >= 0)) {
+                vga_put_pixel(px, py, color);
+                vga_put_pixel(px + 1, py, color);
+                vga_put_pixel(px, py + 1, color);
+            }
+        }
+    }
+}
+
+/* fast plot using compiled bytecode (for pan/zoom redraw) */
+static void plot_equation_fast(const equation_slot *eq, uint32_t color) {
+    if (eq->is_implicit) {
+        plot_implicit_fast(eq, color);
+    } else {
+        plot_explicit_fast(eq, color);
     }
 }
 
@@ -299,8 +355,8 @@ static void draw_panel(void) {
         /* equation text (truncated to fit panel) */
         char display[14];
         int j;
-        for (j = 0; j < 13 && equations[i][j]; j++) {
-            display[j] = equations[i][j];
+        for (j = 0; j < 13 && equations[i].text[j]; j++) {
+            display[j] = equations[i].text[j];
         }
         display[j] = '\0';
         draw_string(42, y, display, eq_colors[i]);
@@ -349,14 +405,23 @@ static void draw_cursor(int char_pos, uint32_t color) {
     vga_fill_rect(x, INPUT_TEXT_Y, 2, FONT_HEIGHT, color);
 }
 
-/* redraw everything: grid, all equations, panel */
+/*
+ * redraw everything using the back buffer (instant update).
+ * draws grid + all equations + UI to the hidden buffer,
+ * then copies it all to the screen at once.
+ */
 static void redraw_all(void) {
+    vga_use_backbuffer();
+
     draw_graph_area();
     for (int i = 0; i < eq_count; i++) {
-        plot_equation(equations[i], eq_colors[i]);
+        plot_equation_fast(&equations[i], eq_colors[i]);
     }
     draw_panel();
     draw_title_bar();
+
+    vga_flush();       /* copy everything to screen in one shot */
+    vga_use_screen();  /* switch back to direct drawing */
 }
 
 /* === KERNEL ENTRY POINT === */
@@ -436,13 +501,22 @@ void kmain(void) {
             }
         } else if (key == '\n') {
             if (input_len > 0 && eq_count < MAX_EQUATIONS) {
-                /* copy input to equation list */
+                /* copy input text to equation slot */
+                equation_slot *slot = &equations[eq_count];
                 for (int i = 0; i <= input_len; i++) {
-                    equations[eq_count][i] = input_buf[i];
+                    slot->text[i] = input_buf[i];
                 }
 
-                /* plot the new equation */
-                plot_equation(equations[eq_count], eq_colors[eq_count]);
+                /* compile the equation to bytecode for fast redraw later */
+                slot->is_implicit = is_implicit_equation(input_buf);
+                if (slot->is_implicit) {
+                    compile_implicit(input_buf, &slot->comp_left, &slot->comp_right);
+                } else {
+                    compile(input_buf, &slot->compiled);
+                }
+
+                /* plot with animation (slow string parsing, directly to screen) */
+                plot_equation_animated(slot->text, eq_colors[eq_count]);
                 eq_count++;
 
                 /* update the side panel */
