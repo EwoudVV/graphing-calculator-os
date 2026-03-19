@@ -49,6 +49,26 @@ void clear_screen(void) {
     }
 }
 
+/*
+ * move the hardware cursor (the blinking underscore)
+ *
+ * the VGA controller has its own cursor that blinks automatically.
+ * but it doesn't know where we're typing - we have to tell it!
+ * we talk to it through ports 0x3D4 (command) and 0x3D5 (data).
+ *
+ * the cursor position is a single number (row * 80 + col),
+ * but it's 16 bits and ports only send 8 bits at a time,
+ * so we send the high byte first (register 14), then low byte (register 15)
+ */
+void move_cursor(int row, int col) {
+    uint16_t pos = row * VGA_WIDTH + col;
+
+    outb(0x3D4, 14);             /* tell VGA: "i'm sending the high byte" */
+    outb(0x3D5, (pos >> 8));     /* send upper 8 bits of position */
+    outb(0x3D4, 15);             /* tell VGA: "now the low byte" */
+    outb(0x3D5, (pos & 0xFF));   /* send lower 8 bits of position */
+}
+
 /* put a single character on screen at a position */
 void put_char_at(char c, int row, int col, uint8_t color) {
     volatile uint16_t *vga = (volatile uint16_t *)VGA_BUFFER;
@@ -67,6 +87,7 @@ void kmain(void) {
     /* input line: where the user types */
     print_at("> ", 8, 2, COLOR_WHITE_ON_BLACK);
     int cursor_col = 4;  /* start after "> " */
+    move_cursor(8, cursor_col);
 
     /*
      * the main loop! this is the "kernel loop" that runs forever.
@@ -90,6 +111,7 @@ void kmain(void) {
             if (cursor_col > 4) {
                 cursor_col--;
                 put_char_at(' ', 8, cursor_col, COLOR_WHITE_ON_BLACK);
+                move_cursor(8, cursor_col);
             }
         } else if (c == '\n') {
             /* enter key: for now, just clear the input line */
@@ -97,10 +119,12 @@ void kmain(void) {
                 put_char_at(' ', 8, i, COLOR_WHITE_ON_BLACK);
             }
             cursor_col = 4;
+            move_cursor(8, cursor_col);
         } else if (cursor_col < VGA_WIDTH - 1) {
             /* regular character: put it on screen and advance cursor */
             put_char_at(c, 8, cursor_col, COLOR_GREEN_ON_BLACK);
             cursor_col++;
+            move_cursor(8, cursor_col);
         }
     }
 }
