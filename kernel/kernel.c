@@ -205,15 +205,27 @@ static void draw_graph_area(void) {
 }
 
 /*
- * SLOW plot (string parsing) - used for the initial animation.
- * draws directly to screen so you see it appear.
+ * tiny busy-wait delay for the drawing animation.
+ * we can't use sleep() (no OS scheduler!) so we just burn CPU cycles.
+ * "volatile" prevents the compiler from optimizing the loop away.
  */
-static void plot_explicit_slow(const char *equation, uint32_t color) {
+static void tiny_delay(void) {
+    for (volatile int d = 0; d < 8000; d++);
+}
+
+/*
+ * ANIMATED plot - draws column by column directly to screen
+ * so you see the equation sweep left-to-right in real time.
+ *
+ * uses compiled bytecode (fast evaluation) but adds a small delay
+ * between columns so the animation is visible.
+ */
+static void plot_explicit_animated(const equation_slot *eq, uint32_t color) {
     int prev_py = -1;
 
     for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px++) {
         float math_x = (float)(px - origin_x) / (float)grid_scale;
-        float math_y = evaluate(equation, math_x);
+        float math_y = eval_compiled(&eq->compiled, math_x, 0.0f);
 
         if (is_nan(math_y)) { prev_py = -1; continue; }
 
@@ -234,20 +246,28 @@ static void plot_explicit_slow(const char *equation, uint32_t color) {
             }
         }
         prev_py = py;
+
+        /* small delay every 4 columns for visible sweep effect */
+        if ((px & 3) == 0) tiny_delay();
     }
 }
 
-static void plot_implicit_slow(const char *equation, uint32_t color) {
+/*
+ * animated implicit plot - sweeps left to right in vertical columns.
+ * for each column, checks every pixel in that column for sign changes.
+ * this gives a nice left-to-right reveal effect for circles, etc.
+ */
+static void plot_implicit_animated(const equation_slot *eq, uint32_t color) {
     float dx = 1.0f / (float)grid_scale;
     float dy = 1.0f / (float)grid_scale;
 
-    for (int py = GRAPH_TOP; py <= GRAPH_BOTTOM; py += 1) {
-        float my = (float)(origin_y - py) / (float)grid_scale;
-        for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px += 1) {
-            float mx = (float)(px - origin_x) / (float)grid_scale;
-            float val   = evaluate_implicit(equation, mx, my);
-            float val_r = evaluate_implicit(equation, mx + dx, my);
-            float val_d = evaluate_implicit(equation, mx, my - dy);
+    for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px++) {
+        float mx = (float)(px - origin_x) / (float)grid_scale;
+        for (int py = GRAPH_TOP; py <= GRAPH_BOTTOM; py++) {
+            float my = (float)(origin_y - py) / (float)grid_scale;
+            float val   = eval_compiled(&eq->comp_left, mx, my) - eval_compiled(&eq->comp_right, mx, my);
+            float val_r = eval_compiled(&eq->comp_left, mx+dx, my) - eval_compiled(&eq->comp_right, mx+dx, my);
+            float val_d = eval_compiled(&eq->comp_left, mx, my-dy) - eval_compiled(&eq->comp_right, mx, my-dy);
             if (is_nan(val) || is_nan(val_r) || is_nan(val_d)) continue;
             if ((val >= 0) != (val_r >= 0) || (val >= 0) != (val_d >= 0)) {
                 vga_put_pixel(px, py, color);
@@ -255,15 +275,17 @@ static void plot_implicit_slow(const char *equation, uint32_t color) {
                 vga_put_pixel(px, py + 1, color);
             }
         }
+        /* delay every 2 columns for visible sweep */
+        if ((px & 1) == 0) tiny_delay();
     }
 }
 
-/* initial plot with animation (string parsing, draws to screen) */
-static void plot_equation_animated(const char *equation, uint32_t color) {
-    if (is_implicit_equation(equation)) {
-        plot_implicit_slow(equation, color);
+/* initial plot with animation (draws directly to screen) */
+static void plot_equation_animated(const equation_slot *eq, uint32_t color) {
+    if (eq->is_implicit) {
+        plot_implicit_animated(eq, color);
     } else {
-        plot_explicit_slow(equation, color);
+        plot_explicit_animated(eq, color);
     }
 }
 
@@ -301,26 +323,70 @@ static void plot_explicit_fast(const equation_slot *eq, uint32_t color) {
     }
 }
 
+/*
+ * FAST implicit plot with adaptive sampling for pan/zoom.
+ *
+ * the naive approach checks EVERY pixel (500*432 = 216,000 evals * 3 neighbors).
+ * that's way too slow for smooth panning.
+ *
+ * adaptive sampling:
+ *   pass 1: evaluate on a COARSE grid (every STEP pixels)
+ *   pass 2: only refine to single pixels in cells where a sign change
+ *           was detected on the coarse grid.
+ *
+ * most of the screen is far from any curve, so pass 1 quickly skips
+ * 90%+ of pixels. only the ~10% near the curve get the expensive pass 2.
+ *
+ * this is the same idea behind "marching squares" in computer graphics.
+ */
 static void plot_implicit_fast(const equation_slot *eq, uint32_t color) {
-    float dx = 1.0f / (float)grid_scale;
-    float dy = 1.0f / (float)grid_scale;
+    #define STEP 4  /* coarse grid step size - check every 4th pixel */
 
-    for (int py = GRAPH_TOP; py <= GRAPH_BOTTOM; py += 1) {
-        float my = (float)(origin_y - py) / (float)grid_scale;
-        for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px += 1) {
-            float mx = (float)(px - origin_x) / (float)grid_scale;
-            /* evaluate left - right using compiled bytecode */
-            float val   = eval_compiled(&eq->comp_left, mx, my) - eval_compiled(&eq->comp_right, mx, my);
-            float val_r = eval_compiled(&eq->comp_left, mx+dx, my) - eval_compiled(&eq->comp_right, mx+dx, my);
-            float val_d = eval_compiled(&eq->comp_left, mx, my-dy) - eval_compiled(&eq->comp_right, mx, my-dy);
-            if (is_nan(val) || is_nan(val_r) || is_nan(val_d)) continue;
-            if ((val >= 0) != (val_r >= 0) || (val >= 0) != (val_d >= 0)) {
-                vga_put_pixel(px, py, color);
-                vga_put_pixel(px + 1, py, color);
-                vga_put_pixel(px, py + 1, color);
+    float inv_scale = 1.0f / (float)grid_scale;
+
+    for (int py = GRAPH_TOP; py <= GRAPH_BOTTOM; py += STEP) {
+        for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px += STEP) {
+            /* coarse check: evaluate at the 4 corners of this cell */
+            float mx0 = (float)(px - origin_x) * inv_scale;
+            float my0 = (float)(origin_y - py) * inv_scale;
+            float mx1 = (float)(px + STEP - origin_x) * inv_scale;
+            float my1 = (float)(origin_y - (py + STEP)) * inv_scale;
+
+            float v00 = eval_compiled(&eq->comp_left, mx0, my0) - eval_compiled(&eq->comp_right, mx0, my0);
+            float v10 = eval_compiled(&eq->comp_left, mx1, my0) - eval_compiled(&eq->comp_right, mx1, my0);
+            float v01 = eval_compiled(&eq->comp_left, mx0, my1) - eval_compiled(&eq->comp_right, mx0, my1);
+            float v11 = eval_compiled(&eq->comp_left, mx1, my1) - eval_compiled(&eq->comp_right, mx1, my1);
+
+            /* if all 4 corners have the same sign, no curve passes through
+               this cell - skip it entirely! this is where we save ~90% of work */
+            if (is_nan(v00) || is_nan(v10) || is_nan(v01) || is_nan(v11)) continue;
+            int s00 = (v00 >= 0), s10 = (v10 >= 0), s01 = (v01 >= 0), s11 = (v11 >= 0);
+            if (s00 == s10 && s10 == s01 && s01 == s11) continue;
+
+            /* sign change detected! refine: check every pixel in this cell */
+            int py_end = py + STEP;
+            int px_end = px + STEP;
+            if (py_end > GRAPH_BOTTOM) py_end = GRAPH_BOTTOM;
+            if (px_end > GRAPH_RIGHT) px_end = GRAPH_RIGHT;
+
+            for (int fy = py; fy <= py_end; fy++) {
+                float my = (float)(origin_y - fy) * inv_scale;
+                for (int fx = px; fx <= px_end; fx++) {
+                    float mx = (float)(fx - origin_x) * inv_scale;
+                    float val   = eval_compiled(&eq->comp_left, mx, my)          - eval_compiled(&eq->comp_right, mx, my);
+                    float val_r = eval_compiled(&eq->comp_left, mx+inv_scale, my) - eval_compiled(&eq->comp_right, mx+inv_scale, my);
+                    float val_d = eval_compiled(&eq->comp_left, mx, my-inv_scale) - eval_compiled(&eq->comp_right, mx, my-inv_scale);
+                    if (is_nan(val) || is_nan(val_r) || is_nan(val_d)) continue;
+                    if ((val >= 0) != (val_r >= 0) || (val >= 0) != (val_d >= 0)) {
+                        vga_put_pixel(fx, fy, color);
+                        vga_put_pixel(fx + 1, fy, color);
+                        vga_put_pixel(fx, fy + 1, color);
+                    }
+                }
             }
         }
     }
+    #undef STEP
 }
 
 /* fast plot using compiled bytecode (for pan/zoom redraw) */
@@ -515,8 +581,8 @@ void kmain(void) {
                     compile(input_buf, &slot->compiled);
                 }
 
-                /* plot with animation (slow string parsing, directly to screen) */
-                plot_equation_animated(slot->text, eq_colors[eq_count]);
+                /* plot with animation (compiled bytecode + delay, directly to screen) */
+                plot_equation_animated(slot, eq_colors[eq_count]);
                 eq_count++;
 
                 /* update the side panel */
