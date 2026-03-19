@@ -14,6 +14,8 @@
  *
  * we check each bit with a bitmask to decide
  * whether to draw a pixel or skip it.
+ *
+ * NOW UPDATED: colors are 32-bit (0x00RRGGBB) instead of 8-bit palette indices.
  */
 
 #ifndef FONT_H
@@ -132,25 +134,15 @@ static const uint8_t font_data[][8] = {
 
 /*
  * draw a single character at pixel position (x, y)
- *
- * for each row of the character (8 rows):
- *   read the byte (8 bits = 8 pixels)
- *   for each bit, if it's 1, draw a pixel
- *
- * bit 7 = leftmost pixel, bit 0 = rightmost pixel
- * we check each bit with a mask that shifts right: 0x80, 0x40, 0x20...
+ * NOW: color is 32-bit RGB instead of palette index
  */
-static void draw_char(int x, int y, char c, uint8_t color) {
-    /* only draw printable ASCII (32-126) */
+static void draw_char(int x, int y, char c, uint32_t color) {
     if (c < 32 || c > 126) return;
-
     const uint8_t *glyph = font_data[c - 32];
 
     for (int row = 0; row < FONT_HEIGHT; row++) {
         uint8_t bits = glyph[row];
         for (int col = 0; col < FONT_WIDTH; col++) {
-            /* check if this pixel should be drawn
-               0x80 >> col shifts the mask right: 10000000, 01000000, ... */
             if (bits & (0x80 >> col)) {
                 vga_put_pixel(x + col, y + row, color);
             }
@@ -159,7 +151,7 @@ static void draw_char(int x, int y, char c, uint8_t color) {
 }
 
 /* draw a string starting at pixel position (x, y) */
-static void draw_string(int x, int y, const char *str, uint8_t color) {
+static void draw_string(int x, int y, const char *str, uint32_t color) {
     for (int i = 0; str[i] != '\0'; i++) {
         draw_char(x + i * FONT_WIDTH, y, str[i], color);
     }

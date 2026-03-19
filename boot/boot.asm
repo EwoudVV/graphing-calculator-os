@@ -52,6 +52,20 @@ _start:
     ; ESP (Extended Stack Pointer) tells the cpu where the stack is
     mov esp, stack_top
 
+    ; initialize the FPU (Floating Point Unit)
+    ; the FPU is a separate math processor that handles decimal numbers.
+    ; historically it was a separate chip (the 8087/80287/80387).
+    ; now it's built into the CPU, but we still need to enable it.
+    ;
+    ; CR0 is a control register that configures CPU features:
+    ;   bit 2 (EM) = "emulate FPU" - we CLEAR this (we have a real FPU)
+    ;   bit 1 (MP) = "monitor coprocessor" - we SET this
+    mov eax, cr0
+    and eax, 0xFFFFFFFB         ; clear bit 2 (EM) - don't emulate, use real FPU
+    or eax, 0x00000002          ; set bit 1 (MP) - enable FPU monitoring
+    mov cr0, eax
+    fninit                      ; initialize the FPU registers
+
     ; call the C kernel
     call kmain
 

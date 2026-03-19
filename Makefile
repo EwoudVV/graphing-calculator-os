@@ -41,7 +41,7 @@ kernel/%.o: kernel/%.c
 # -kernel flag tells QEMU to load the binary as a multiboot kernel
 # QEMU has a built-in multiboot loader, no grub ISO needed
 run: kernel.bin
-	qemu-system-i386 -kernel kernel.bin
+	qemu-system-i386 -vga std -kernel kernel.bin
 
 clean:
 	rm -f boot/*.o kernel/*.o kernel.bin

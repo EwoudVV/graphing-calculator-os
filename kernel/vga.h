@@ -1,25 +1,24 @@
 /*
- * vga.h - VGA graphics mode driver
+ * vga.h - VGA graphics driver (now with high resolution!)
  *
- * VGA has two main modes:
- *   - text mode (what we've been using): 80x25 characters
- *   - graphics mode 0x13: 320x200 pixels, 256 colors
+ * UPGRADE: we moved from VGA mode 0x13 (320x200) to 640x480 using
+ * the "Bochs VBE" (VESA BIOS Extensions) interface.
  *
- * in mode 0x13, the framebuffer is at address 0xA0000.
- * each byte = one pixel, and the byte value = color index (0-255).
- * the screen is 320 pixels wide and 200 pixels tall = 64000 bytes.
+ * how it works:
+ *   old way: VGA mode 0x13 = framebuffer at fixed address 0xA0000, 320x200
+ *   new way: Bochs VBE = we TELL the display what resolution we want,
+ *            and it gives us a big framebuffer somewhere in memory.
  *
- * to switch modes, we have to program a bunch of VGA registers.
- * the VGA controller has 5 groups of registers, each controlling
- * different parts of the display hardware:
- *   - Miscellaneous: clock speed, sync polarity
- *   - Sequencer: memory access, clocking
- *   - CRTC: screen timing (when to draw, when to blank)
- *   - Graphics Controller: how CPU accesses video memory
- *   - Attribute Controller: color palette mapping
+ * QEMU emulates a "Bochs Display Adapter" which supports this.
+ * we talk to it through I/O ports 0x01CE (index) and 0x01CF (data).
  *
- * we just load pre-set values for mode 0x13 into all of them.
- * these values are standardized - every VGA card uses the same ones.
+ * but where's the framebuffer? it's a PCI device, so its memory address
+ * is stored in a "PCI BAR" (Base Address Register). we read it from
+ * the PCI configuration space using ports 0x0CF8/0x0CFC.
+ *
+ * we use 32 bits per pixel (true color):
+ *   each pixel = 4 bytes = 0x00RRGGBB
+ *   no palette needed - we specify exact RGB colors!
  */
 
 #ifndef VGA_H
@@ -28,152 +27,156 @@
 #include <stdint.h>
 #include "ports.h"
 
-#define VGA_FRAMEBUFFER 0xA0000
-#define SCREEN_WIDTH    320
-#define SCREEN_HEIGHT   200
+#define SCREEN_WIDTH    640
+#define SCREEN_HEIGHT   480
 
-/* standard VGA palette colors (first 16) */
-#define COLOR_BLACK        0
-#define COLOR_BLUE         1
-#define COLOR_GREEN        2
-#define COLOR_CYAN         3
-#define COLOR_RED          4
-#define COLOR_MAGENTA      5
-#define COLOR_BROWN        6
-#define COLOR_LIGHT_GRAY   7
-#define COLOR_DARK_GRAY    8
-#define COLOR_LIGHT_BLUE   9
-#define COLOR_LIGHT_GREEN  10
-#define COLOR_LIGHT_CYAN   11
-#define COLOR_LIGHT_RED    12
-#define COLOR_LIGHT_MAGENTA 13
-#define COLOR_YELLOW       14
-#define COLOR_WHITE        15
-
-/* ============================================================
- * VGA register values for mode 0x13 (320x200x256)
- * ============================================================
- * these are basically a "recipe" - load these exact numbers
- * into the VGA registers and you get mode 0x13.
- * every VGA-compatible card uses the same values.
+/* === Bochs VBE register interface ===
+ * the display adapter has numbered registers.
+ * to access one: write the register number to port 0x01CE,
+ * then read/write the value at port 0x01CF.
  */
+#define VBE_INDEX_PORT   0x01CE
+#define VBE_DATA_PORT    0x01CF
 
-/* miscellaneous output register - controls basic VGA operation
-   0x63 = use 0x3D4/0x3D5 ports, enable RAM, 28MHz clock */
-static const uint8_t mode_13h_misc = 0x63;
+#define VBE_REG_XRES     0x01   /* horizontal resolution */
+#define VBE_REG_YRES     0x02   /* vertical resolution */
+#define VBE_REG_BPP      0x03   /* bits per pixel */
+#define VBE_REG_ENABLE   0x04   /* enable/disable the display */
 
-/* sequencer registers - control memory access and timing */
-static const uint8_t mode_13h_seq[] = {
-    0x03, 0x01, 0x0F, 0x00, 0x0E
-};
+#define VBE_ENABLED      0x01   /* turn on VBE mode */
+#define VBE_LFB_ENABLED  0x40   /* use Linear FrameBuffer (not banked) */
 
-/* CRT controller registers - control screen timing
-   (when to start/stop drawing each scanline, refresh rate, etc) */
-static const uint8_t mode_13h_crtc[] = {
-    0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, 0xBF, 0x1F,
-    0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x9C, 0x0E, 0x8F, 0x28, 0x40, 0x96, 0xB9, 0xA3, 0xFF
-};
-
-/* graphics controller registers - control how CPU reads/writes video RAM */
-static const uint8_t mode_13h_gc[] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x05, 0x0F, 0xFF
-};
-
-/* attribute controller registers - map color indices to actual colors */
-static const uint8_t mode_13h_ac[] = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-    0x41, 0x00, 0x0F, 0x00, 0x00
-};
-
-/*
- * write a list of values to sequential VGA registers.
- * many VGA register groups work as index/data pairs:
- *   - write the register number to the index port
- *   - write the value to the data port
- */
-static void vga_write_regs(uint16_t index_port, uint16_t data_port,
-                           const uint8_t *values, int count) {
-    for (int i = 0; i < count; i++) {
-        outb(index_port, i);
-        outb(data_port, values[i]);
-    }
+/* write a value to a Bochs VBE register */
+static inline void vbe_write(uint16_t reg, uint16_t value) {
+    outw(VBE_INDEX_PORT, reg);
+    outw(VBE_DATA_PORT, value);
 }
 
-/*
- * switch the VGA card to mode 0x13 (320x200, 256 colors)
+/* === PCI configuration space ===
+ * PCI is the bus that connects hardware (VGA, network, etc) to the CPU.
+ * each device has a "configuration space" with info about it.
+ * BAR 0 (Base Address Register 0) tells us where the framebuffer is in memory.
  *
- * this programs all 5 register groups in order.
- * after this function, the screen shows pixels instead of text,
- * and we can draw by writing bytes to 0xA0000.
+ * to read PCI config: write the address to port 0x0CF8, read data from 0x0CFC.
+ * the address encodes: bus number, device number, function, and register offset.
+ *
+ * in QEMU's default machine (i440fx), the VGA card is at bus 0, device 2, function 0.
+ */
+#define PCI_CONFIG_ADDR  0x0CF8
+#define PCI_CONFIG_DATA  0x0CFC
+
+static uint32_t pci_read(uint8_t bus, uint8_t device, uint8_t func, uint8_t offset) {
+    /*
+     * PCI config address format (32 bits):
+     *   bit 31    = 1 (enable config access)
+     *   bits 16-23 = bus number
+     *   bits 11-15 = device number
+     *   bits 8-10  = function number
+     *   bits 0-7   = register offset (must be 4-byte aligned)
+     */
+    uint32_t addr = (1u << 31) | ((uint32_t)bus << 16) |
+                    ((uint32_t)device << 11) | ((uint32_t)func << 8) |
+                    (offset & 0xFC);
+    outl(PCI_CONFIG_ADDR, addr);
+    return inl(PCI_CONFIG_DATA);
+}
+
+/* === 32-bit color definitions (0x00RRGGBB) ===
+ * with 32bpp we can use ANY color! no more 16-color palette.
+ */
+#define COLOR_BLACK         0x00000000
+#define COLOR_WHITE         0x00FFFFFF
+#define COLOR_DARK_GRAY     0x00333333
+#define COLOR_GRAY          0x00808080
+#define COLOR_LIGHT_GRAY    0x00B0B0B0
+
+/* graph colors for multiple equations */
+#define COLOR_LIGHT_GREEN   0x0055FF55
+#define COLOR_LIGHT_RED     0x00FF5555
+#define COLOR_LIGHT_BLUE    0x005599FF
+#define COLOR_YELLOW        0x00FFFF55
+#define COLOR_LIGHT_CYAN    0x0055FFFF
+#define COLOR_LIGHT_MAGENTA 0x00FF55FF
+
+/* UI colors */
+#define COLOR_TITLE_BG      0x00182848
+#define COLOR_PANEL_BG      0x00202020
+#define COLOR_INPUT_BG      0x00303030
+#define COLOR_GRID_DOT      0x00303050
+#define COLOR_AXIS          0x00707070
+#define COLOR_TICK           0x00A0A0A0
+
+/* the framebuffer pointer - set during init */
+static volatile uint32_t *framebuffer;
+
+/*
+ * initialize 640x480x32 graphics mode using Bochs VBE.
+ *
+ * step 1: find framebuffer address from PCI
+ * step 2: program the display resolution
  */
 static void vga_init_graphics(void) {
-    /* 1. miscellaneous register - set basic VGA parameters */
-    outb(0x3C2, mode_13h_misc);
+    /*
+     * step 1: find the framebuffer address.
+     *
+     * the VGA card is a PCI device. its framebuffer is mapped into
+     * the CPU's memory space at an address stored in BAR 0.
+     * in QEMU, the VGA is at bus 0, device 2, function 0.
+     * BAR 0 is at PCI config offset 0x10.
+     */
+    uint32_t bar0 = pci_read(0, 2, 0, 0x10);
+    /* mask off the lower 4 bits (they're flags, not part of the address) */
+    framebuffer = (volatile uint32_t *)(bar0 & 0xFFFFFFF0);
 
-    /* 2. sequencer registers - control memory and clocking
-       first, reset the sequencer (register 0 = 0x03 enables it) */
-    vga_write_regs(0x3C4, 0x3C5, mode_13h_seq, 5);
-
-    /* 3. CRTC registers - control display timing
-       must unlock CRTC first by clearing bit 7 of register 0x11 */
-    outb(0x3D4, 0x11);
-    outb(0x3D5, inb(0x3D5) & 0x7F);  /* clear protect bit */
-    vga_write_regs(0x3D4, 0x3D5, mode_13h_crtc, 25);
-
-    /* 4. graphics controller registers - control memory access mode */
-    vga_write_regs(0x3CE, 0x3CF, mode_13h_gc, 9);
-
-    /* 5. attribute controller registers - control palette
-       the AC is weird: you write index AND data to the same port (0x3C0)
-       but first read from 0x3DA to reset its flip-flop state */
-    inb(0x3DA);  /* reset attribute controller flip-flop */
-    for (int i = 0; i < 21; i++) {
-        outb(0x3C0, i);              /* write index */
-        outb(0x3C0, mode_13h_ac[i]); /* write value */
-    }
-    /* re-enable video output (bit 5 of AC index register) */
-    outb(0x3C0, 0x20);
+    /*
+     * step 2: set the display mode.
+     * disable VBE first, change settings, then re-enable.
+     * this is like turning off a monitor before changing its resolution.
+     */
+    vbe_write(VBE_REG_ENABLE, 0x00);             /* disable */
+    vbe_write(VBE_REG_XRES, SCREEN_WIDTH);        /* 640 pixels wide */
+    vbe_write(VBE_REG_YRES, SCREEN_HEIGHT);       /* 480 pixels tall */
+    vbe_write(VBE_REG_BPP, 32);                   /* 32 bits per pixel */
+    vbe_write(VBE_REG_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED); /* enable! */
 }
 
 /*
- * draw a single pixel at (x, y) with the given color.
- * the framebuffer is a flat array: position = y * 320 + x
- * each byte is one pixel.
+ * draw a single pixel at (x, y) with a 32-bit color.
+ * the framebuffer is a flat array: position = y * width + x
+ * each element is a uint32_t (4 bytes) = one pixel.
  */
-static inline void vga_put_pixel(int x, int y, uint8_t color) {
+static inline void vga_put_pixel(int x, int y, uint32_t color) {
     if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT) return;
-    volatile uint8_t *fb = (volatile uint8_t *)VGA_FRAMEBUFFER;
-    fb[y * SCREEN_WIDTH + x] = color;
+    framebuffer[y * SCREEN_WIDTH + x] = color;
 }
 
 /* clear the entire screen to one color */
-static void vga_clear(uint8_t color) {
-    volatile uint8_t *fb = (volatile uint8_t *)VGA_FRAMEBUFFER;
+static void vga_clear(uint32_t color) {
     for (int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
-        fb[i] = color;
+        framebuffer[i] = color;
     }
 }
 
 /* draw a horizontal line */
-static void vga_draw_hline(int x, int y, int width, uint8_t color) {
+static void vga_draw_hline(int x, int y, int width, uint32_t color) {
     for (int i = 0; i < width; i++) {
         vga_put_pixel(x + i, y, color);
     }
 }
 
 /* draw a vertical line */
-static void vga_draw_vline(int x, int y, int height, uint8_t color) {
+static void vga_draw_vline(int x, int y, int height, uint32_t color) {
     for (int i = 0; i < height; i++) {
         vga_put_pixel(x, y + i, color);
     }
 }
 
 /* draw a filled rectangle */
-static void vga_fill_rect(int x, int y, int w, int h, uint8_t color) {
+static void vga_fill_rect(int x, int y, int w, int h, uint32_t color) {
     for (int row = 0; row < h; row++) {
-        vga_draw_hline(x, y + row, w, color);
+        for (int col = 0; col < w; col++) {
+            vga_put_pixel(x + col, y + row, color);
+        }
     }
 }
 
