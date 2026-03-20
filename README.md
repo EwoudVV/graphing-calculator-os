@@ -11,6 +11,14 @@ Type in a math equation and see it graphed on screen. The OS handles keyboard in
 - draws axes, a grid, and plots the graph on screen
 - supports basic math operations (more coming later)
 
+## how to run:
+ - downlaod the .iso file
+ - create a virtual machine (for example in virtualbox, utm, etc)
+ - OR you can flash the iso to a usb stick and boot your computer directly off of that
+ - make sure in the VM settings, architecture is set to x84-64 and display is set to VGA
+
+## you can also run it by using qemu without a vm app:
+
 ## dependencies
 
 you need a cross-compiler and an emulator to build and run this:
@@ -26,7 +34,7 @@ brew install nasm qemu
 brew install i686-elf-gcc i686-elf-binutils
 ```
 
-## how to run
+## run it:
 
 ```
 make run
