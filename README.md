@@ -67,38 +67,31 @@ make clean     - delete build files for a fresh build
 ## project structure
 
 ```
-boot/boot.asm          - bootloader (x86 assembly). sets up the stack,
-                         initializes the FPU, and jumps to the C kernel.
-
-kernel/kernel.c        - the entire OS kernel. handles UI, graph plotting,
-                         trace mode, tangent lines, mouse/keyboard input,
-                         curve layer optimization, and the main loop.
-
-kernel/math_parser.h   - equation parser + bytecode compiler + stack VM.
-                         compiles "x^2+1" into bytecode once, then runs it
-                         thousands of times per frame (way faster than
-                         re-parsing the string every pixel).
-
-kernel/vga.h           - VGA graphics driver. sets up 1280x960x32bpp via
-                         Bochs VBE registers, handles double buffering,
-                         2x pixel scaling, and drawing primitives.
-
-kernel/keyboard.h      - PS/2 keyboard driver. reads scancodes from port
-                         0x60, translates to characters, handles shift.
-
-kernel/mouse.h         - PS/2 mouse driver. non-blocking state machine
-                         that collects 3-byte packets one byte at a time.
-
-kernel/font.h          - 8x8 bitmap font for drawing text in graphics mode.
-
-kernel/ports.h         - low-level x86 I/O port functions (inb/outb/inw/outw).
-
-linker.ld              - linker script, tells the linker how to lay out
-                         the kernel binary in memory.
-
-Makefile               - builds everything and creates the bootable ISO.
-
-iso/boot/grub/grub.cfg - GRUB bootloader config for the ISO.
+graphing-calculator-os/
+├── boot/
+│   └── boot.asm            - bootloader (x86 asm). sets up stack,
+│                              inits the FPU, jumps to C kernel
+├── kernel/
+│   ├── kernel.c            - the entire OS. UI, plotting, trace,
+│   │                         tangent lines, mouse, keyboard, main loop
+│   ├── math_parser.h       - equation parser + bytecode compiler + VM.
+│   │                         compiles "x^2+1" to bytecode, runs it
+│   │                         thousands of times per frame
+│   ├── vga.h               - graphics driver. 1280x960x32bpp via Bochs
+│   │                         VBE, double buffering, 2x pixel scaling
+│   ├── keyboard.h          - PS/2 keyboard driver. scancodes from port
+│   │                         0x60, shift support
+│   ├── mouse.h             - PS/2 mouse driver. non-blocking state
+│   │                         machine, 3-byte packet collection
+│   ├── font.h              - 8x8 bitmap font for text rendering
+│   └── ports.h             - x86 I/O port functions (inb/outb/inw/outw)
+├── iso/
+│   └── boot/
+│       └── grub/
+│           └── grub.cfg    - GRUB bootloader config for the ISO
+├── linker.ld               - memory layout for the kernel binary
+├── Makefile                - builds everything + creates bootable ISO
+└── graphcalcos.iso         - the bootable ISO (after make iso)
 ```
 
 ## controls
