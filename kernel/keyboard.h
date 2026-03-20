@@ -62,8 +62,22 @@ static const char scancode_to_ascii_shifted[128] = {
 static int shift_held = 0;
 static int extended_key = 0;  /* 1 = next scancode is an extended key */
 
+/*
+ * check if there's KEYBOARD data ready to read.
+ *
+ * IMPORTANT: both keyboard and mouse share port 0x60!
+ * the status register at port 0x64 tells us which device sent the data:
+ *   bit 0 = 1 means "there's data on port 0x60"
+ *   bit 5 = 1 means "the data is from the MOUSE" (auxiliary device)
+ *   bit 5 = 0 means "the data is from the KEYBOARD"
+ *
+ * if we don't check bit 5, we'll accidentally read mouse movement
+ * bytes as keyboard scancodes = garbage characters in the input box!
+ */
 static inline int keyboard_has_data(void) {
-    return inb(KEYBOARD_STATUS_PORT) & 0x01;
+    uint8_t status = inb(KEYBOARD_STATUS_PORT);
+    /* data must be available (bit 0) AND it must NOT be from the mouse (bit 5) */
+    return (status & 0x01) && !(status & 0x20);
 }
 
 /*

@@ -82,6 +82,80 @@ static inline float my_abs(float x) {
     return result;
 }
 
+/*
+ * natural logarithm: ln(x)
+ *
+ * x87 has fyl2x which computes y * log2(x).
+ * if we set y = ln(2), we get ln(2) * log2(x) = ln(x).
+ * fldln2 pushes ln(2) for us!
+ */
+static inline float my_ln(float x) {
+    if (x <= 0.0f) { volatile float z = 0.0f; return z / z; }
+    float result;
+    __asm__ volatile (
+        "fldln2\n\t"
+        "flds %1\n\t"
+        "fyl2x\n\t"
+        "fstps %0"
+        : "=m"(result) : "m"(x)
+    );
+    return result;
+}
+
+/*
+ * base-10 logarithm: log(x)
+ *
+ * same trick as ln, but fldlg2 pushes log10(2).
+ * log10(2) * log2(x) = log10(x).
+ */
+static inline float my_log10(float x) {
+    if (x <= 0.0f) { volatile float z = 0.0f; return z / z; }
+    float result;
+    __asm__ volatile (
+        "fldlg2\n\t"
+        "flds %1\n\t"
+        "fyl2x\n\t"
+        "fstps %0"
+        : "=m"(result) : "m"(x)
+    );
+    return result;
+}
+
+/*
+ * exponential: e^x
+ *
+ * x87 doesn't have e^x directly, but it has 2^x (sort of).
+ * the trick: e^x = 2^(x * log2(e))
+ *
+ * step by step:
+ *   1. compute x * log2(e)     (fldl2e pushes log2(e))
+ *   2. split into integer + fraction parts
+ *   3. f2xm1 computes 2^fraction - 1 (only works for -1 <= frac <= 1)
+ *   4. add 1 to get 2^fraction
+ *   5. fscale multiplies by 2^integer
+ *   6. result = 2^fraction * 2^integer = 2^(x*log2e) = e^x
+ */
+static inline float my_exp(float x) {
+    float result;
+    __asm__ volatile (
+        "flds %1\n\t"
+        "fldl2e\n\t"
+        "fmulp\n\t"
+        "fld %%st(0)\n\t"
+        "frndint\n\t"
+        "fxch %%st(1)\n\t"
+        "fsub %%st(1), %%st(0)\n\t"
+        "f2xm1\n\t"
+        "fld1\n\t"
+        "faddp\n\t"
+        "fscale\n\t"
+        "fstp %%st(1)\n\t"
+        "fstps %0"
+        : "=m"(result) : "m"(x)
+    );
+    return result;
+}
+
 /* NaN helpers */
 static inline float make_nan(void) { volatile float z = 0.0f; return z / z; }
 static inline int is_nan(float x) { return x != x; }
@@ -131,6 +205,9 @@ static float power(float base, float exp) {
 #define OP_TAN       12
 #define OP_SQRT      13
 #define OP_ABS       14
+#define OP_LN        15
+#define OP_LOG       16
+#define OP_EXP       17
 
 #define MAX_OPS 128
 
@@ -244,11 +321,16 @@ static void compile_atom(const char **s, compiled_eq *eq) {
     if (match_word(s, "tan"))  { skip_spaces(s); if(**s=='(')(*s)++; compile_expr(s,eq); skip_spaces(s); if(**s==')')(*s)++; emit(eq, OP_TAN); return; }
     if (match_word(s, "sqrt")) { skip_spaces(s); if(**s=='(')(*s)++; compile_expr(s,eq); skip_spaces(s); if(**s==')')(*s)++; emit(eq, OP_SQRT); return; }
     if (match_word(s, "abs"))  { skip_spaces(s); if(**s=='(')(*s)++; compile_expr(s,eq); skip_spaces(s); if(**s==')')(*s)++; emit(eq, OP_ABS); return; }
+    if (match_word(s, "ln"))   { skip_spaces(s); if(**s=='(')(*s)++; compile_expr(s,eq); skip_spaces(s); if(**s==')')(*s)++; emit(eq, OP_LN); return; }
+    if (match_word(s, "log"))  { skip_spaces(s); if(**s=='(')(*s)++; compile_expr(s,eq); skip_spaces(s); if(**s==')')(*s)++; emit(eq, OP_LOG); return; }
+    if (match_word(s, "exp"))  { skip_spaces(s); if(**s=='(')(*s)++; compile_expr(s,eq); skip_spaces(s); if(**s==')')(*s)++; emit(eq, OP_EXP); return; }
 
     if (**s == 'x') { (*s)++; emit(eq, OP_PUSH_X); return; }
     if (**s == 'y') { (*s)++; emit(eq, OP_PUSH_Y); return; }
 
     if (match_word(s, "pi")) { emit_num(eq, 3.14159265f); return; }
+    /* e constant: 2.71828... (must check AFTER "exp" to avoid conflict) */
+    if (**s == 'e' && !is_alpha(*(*s+1))) { (*s)++; emit_num(eq, 2.71828183f); return; }
 
     if (is_digit(**s) || **s == '.') { emit_num(eq, parse_number(s)); return; }
 
@@ -297,6 +379,9 @@ static float eval_compiled(const compiled_eq *eq, float x, float y) {
             case OP_TAN:  if (sp >= 1) { stack[sp-1] = my_tan(stack[sp-1]); } break;
             case OP_SQRT: if (sp >= 1) { stack[sp-1] = my_sqrt(stack[sp-1]); } break;
             case OP_ABS:  if (sp >= 1) { stack[sp-1] = my_abs(stack[sp-1]); } break;
+            case OP_LN:   if (sp >= 1) { stack[sp-1] = my_ln(stack[sp-1]); } break;
+            case OP_LOG:  if (sp >= 1) { stack[sp-1] = my_log10(stack[sp-1]); } break;
+            case OP_EXP:  if (sp >= 1) { stack[sp-1] = my_exp(stack[sp-1]); } break;
         }
     }
 
@@ -431,9 +516,13 @@ static float eval_atom_str(const char **s, float x, float y) {
     if (match_word(s, "tan"))  { skip_spaces(s); if(**s=='(')(*s)++; float v = eval_expr_str(s,x,y); skip_spaces(s); if(**s==')')(*s)++; return my_tan(v); }
     if (match_word(s, "sqrt")) { skip_spaces(s); if(**s=='(')(*s)++; float v = eval_expr_str(s,x,y); skip_spaces(s); if(**s==')')(*s)++; return my_sqrt(v); }
     if (match_word(s, "abs"))  { skip_spaces(s); if(**s=='(')(*s)++; float v = eval_expr_str(s,x,y); skip_spaces(s); if(**s==')')(*s)++; return my_abs(v); }
+    if (match_word(s, "ln"))   { skip_spaces(s); if(**s=='(')(*s)++; float v = eval_expr_str(s,x,y); skip_spaces(s); if(**s==')')(*s)++; return my_ln(v); }
+    if (match_word(s, "log"))  { skip_spaces(s); if(**s=='(')(*s)++; float v = eval_expr_str(s,x,y); skip_spaces(s); if(**s==')')(*s)++; return my_log10(v); }
+    if (match_word(s, "exp"))  { skip_spaces(s); if(**s=='(')(*s)++; float v = eval_expr_str(s,x,y); skip_spaces(s); if(**s==')')(*s)++; return my_exp(v); }
     if (**s == 'x') { (*s)++; return x; }
     if (**s == 'y') { (*s)++; return y; }
     if (match_word(s, "pi")) return 3.14159265f;
+    if (**s == 'e' && !is_alpha(*(*s+1))) { (*s)++; return 2.71828183f; }
     if (is_digit(**s) || **s == '.') return parse_number(s);
     return make_nan();
 }

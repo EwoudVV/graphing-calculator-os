@@ -43,7 +43,42 @@ kernel/%.o: kernel/%.c
 run: kernel.bin
 	qemu-system-i386 -vga std -kernel kernel.bin
 
-clean:
-	rm -f boot/*.o kernel/*.o kernel.bin
+# === ISO BUILD TARGET ===
+#
+# Creates a bootable CD-ROM image (.iso) using GRUB as the bootloader.
+# This is useful for:
+#   - booting on real hardware (burn to USB/CD)
+#   - distributing your OS as a single file anyone can run
+#   - testing with GRUB's boot menu (closer to real hardware behavior)
+#
+# How it works:
+#   1. Create a directory structure that GRUB expects:
+#        iso/boot/kernel.bin    (our kernel)
+#        iso/boot/grub/grub.cfg (GRUB's configuration file)
+#   2. Run grub-mkrescue, which packages everything into a bootable ISO
+#      that includes GRUB itself + our kernel + the config
+#
+# The ISO contains a tiny GRUB bootloader that loads our kernel using
+# the multiboot protocol -- the same protocol QEMU's -kernel flag uses.
+iso: kernel.bin
+	mkdir -p iso/boot/grub
+	cp kernel.bin iso/boot/kernel.bin
+	echo 'set timeout=0'                    >  iso/boot/grub/grub.cfg
+	echo 'set default=0'                    >> iso/boot/grub/grub.cfg
+	echo ''                                 >> iso/boot/grub/grub.cfg
+	echo 'menuentry "GraphCalcOS" {'        >> iso/boot/grub/grub.cfg
+	echo '    multiboot /boot/kernel.bin'   >> iso/boot/grub/grub.cfg
+	echo '    boot'                         >> iso/boot/grub/grub.cfg
+	echo '}'                                >> iso/boot/grub/grub.cfg
+	i686-elf-grub-mkrescue -o graphcalcos.iso iso
 
-.PHONY: all run clean
+# boot the ISO in QEMU (uses -cdrom instead of -kernel)
+# this tests the full GRUB boot path, just like real hardware would
+run-iso: graphcalcos.iso
+	qemu-system-i386 -vga std -cdrom graphcalcos.iso
+
+clean:
+	rm -f boot/*.o kernel/*.o kernel.bin graphcalcos.iso
+	rm -rf iso
+
+.PHONY: all run iso run-iso clean

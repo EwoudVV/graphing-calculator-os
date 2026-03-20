@@ -4,6 +4,11 @@
  * UPGRADE: we moved from VGA mode 0x13 (320x200) to 640x480 using
  * the "Bochs VBE" (VESA BIOS Extensions) interface.
  *
+ * SCALING: the VBE hardware runs at 1280x960 (big window), but all
+ * our drawing code works at 640x480 (logical resolution). the flush
+ * function scales each pixel to a 2x2 block. this gives us a nice
+ * big window without changing any drawing code or layout math.
+ *
  * how it works:
  *   old way: VGA mode 0x13 = framebuffer at fixed address 0xA0000, 320x200
  *   new way: Bochs VBE = we TELL the display what resolution we want,
@@ -11,10 +16,6 @@
  *
  * QEMU emulates a "Bochs Display Adapter" which supports this.
  * we talk to it through I/O ports 0x01CE (index) and 0x01CF (data).
- *
- * but where's the framebuffer? it's a PCI device, so its memory address
- * is stored in a "PCI BAR" (Base Address Register). we read it from
- * the PCI configuration space using ports 0x0CF8/0x0CFC.
  *
  * we use 32 bits per pixel (true color):
  *   each pixel = 4 bytes = 0x00RRGGBB
@@ -27,53 +28,45 @@
 #include <stdint.h>
 #include "ports.h"
 
+/*
+ * LOGICAL resolution - what all drawing code uses.
+ * the back buffer, all coordinates, all layout math uses these.
+ */
 #define SCREEN_WIDTH    640
 #define SCREEN_HEIGHT   480
 
-/* === Bochs VBE register interface ===
- * the display adapter has numbered registers.
- * to access one: write the register number to port 0x01CE,
- * then read/write the value at port 0x01CF.
+/*
+ * PHYSICAL resolution - the actual VBE framebuffer size.
+ * each logical pixel becomes a SCALE x SCALE block on screen.
+ * this makes the window physically larger without changing the
+ * pixel density or any layout code.
  */
+#define SCALE           2
+#define REAL_WIDTH      (SCREEN_WIDTH * SCALE)
+#define REAL_HEIGHT     (SCREEN_HEIGHT * SCALE)
+
+/* === Bochs VBE register interface === */
 #define VBE_INDEX_PORT   0x01CE
 #define VBE_DATA_PORT    0x01CF
 
-#define VBE_REG_XRES     0x01   /* horizontal resolution */
-#define VBE_REG_YRES     0x02   /* vertical resolution */
-#define VBE_REG_BPP      0x03   /* bits per pixel */
-#define VBE_REG_ENABLE   0x04   /* enable/disable the display */
+#define VBE_REG_XRES     0x01
+#define VBE_REG_YRES     0x02
+#define VBE_REG_BPP      0x03
+#define VBE_REG_ENABLE   0x04
 
-#define VBE_ENABLED      0x01   /* turn on VBE mode */
-#define VBE_LFB_ENABLED  0x40   /* use Linear FrameBuffer (not banked) */
+#define VBE_ENABLED      0x01
+#define VBE_LFB_ENABLED  0x40
 
-/* write a value to a Bochs VBE register */
 static inline void vbe_write(uint16_t reg, uint16_t value) {
     outw(VBE_INDEX_PORT, reg);
     outw(VBE_DATA_PORT, value);
 }
 
-/* === PCI configuration space ===
- * PCI is the bus that connects hardware (VGA, network, etc) to the CPU.
- * each device has a "configuration space" with info about it.
- * BAR 0 (Base Address Register 0) tells us where the framebuffer is in memory.
- *
- * to read PCI config: write the address to port 0x0CF8, read data from 0x0CFC.
- * the address encodes: bus number, device number, function, and register offset.
- *
- * in QEMU's default machine (i440fx), the VGA card is at bus 0, device 2, function 0.
- */
+/* === PCI configuration space === */
 #define PCI_CONFIG_ADDR  0x0CF8
 #define PCI_CONFIG_DATA  0x0CFC
 
 static uint32_t pci_read(uint8_t bus, uint8_t device, uint8_t func, uint8_t offset) {
-    /*
-     * PCI config address format (32 bits):
-     *   bit 31    = 1 (enable config access)
-     *   bits 16-23 = bus number
-     *   bits 11-15 = device number
-     *   bits 8-10  = function number
-     *   bits 0-7   = register offset (must be 4-byte aligned)
-     */
     uint32_t addr = (1u << 31) | ((uint32_t)bus << 16) |
                     ((uint32_t)device << 11) | ((uint32_t)func << 8) |
                     (offset & 0xFC);
@@ -81,16 +74,13 @@ static uint32_t pci_read(uint8_t bus, uint8_t device, uint8_t func, uint8_t offs
     return inl(PCI_CONFIG_DATA);
 }
 
-/* === 32-bit color definitions (0x00RRGGBB) ===
- * with 32bpp we can use ANY color! no more 16-color palette.
- */
+/* === 32-bit color definitions (0x00RRGGBB) === */
 #define COLOR_BLACK         0x00000000
 #define COLOR_WHITE         0x00FFFFFF
 #define COLOR_DARK_GRAY     0x00333333
 #define COLOR_GRAY          0x00808080
 #define COLOR_LIGHT_GRAY    0x00B0B0B0
 
-/* graph colors for multiple equations */
 #define COLOR_LIGHT_GREEN   0x0055FF55
 #define COLOR_LIGHT_RED     0x00FF5555
 #define COLOR_LIGHT_BLUE    0x005599FF
@@ -98,7 +88,6 @@ static uint32_t pci_read(uint8_t bus, uint8_t device, uint8_t func, uint8_t offs
 #define COLOR_LIGHT_CYAN    0x0055FFFF
 #define COLOR_LIGHT_MAGENTA 0x00FF55FF
 
-/* UI colors */
 #define COLOR_TITLE_BG      0x00182848
 #define COLOR_PANEL_BG      0x00202020
 #define COLOR_INPUT_BG      0x00303030
@@ -106,58 +95,30 @@ static uint32_t pci_read(uint8_t bus, uint8_t device, uint8_t func, uint8_t offs
 #define COLOR_AXIS          0x00707070
 #define COLOR_TICK           0x00A0A0A0
 
-/* the framebuffer pointer (actual screen) - set during init */
+/* the framebuffer pointer (actual screen at REAL resolution) */
 static volatile uint32_t *framebuffer;
 
 /*
- * DOUBLE BUFFERING
+ * DOUBLE BUFFERING at LOGICAL resolution.
  *
- * the problem: when we draw directly to the framebuffer (screen),
- * the user sees every pixel appear one by one. for panning/zooming
- * this looks terrible - you see the old image get erased and the
- * new one drawn progressively.
+ * all drawing happens at 640x480 in the back buffer.
+ * when we flush, each pixel gets scaled to 2x2 on the real framebuffer.
  *
- * the solution: draw to a hidden "back buffer" in regular RAM,
- * then copy the entire buffer to the screen in one fast operation.
- * the user sees an instant update instead of progressive drawing.
+ * draw_target points to either:
+ *   back_buffer -> for off-screen rendering (pan/zoom)
+ *   screen_buffer -> for direct "visible" drawing (animation)
  *
- * this is the same technique used by every game and OS:
- *   1. draw the next frame to the back buffer (invisible)
- *   2. "flip" - copy back buffer to screen (instant)
- *
- * we use a pointer called draw_target that all drawing functions
- * write to. by switching this pointer, we control WHERE pixels go:
- *   draw_target = framebuffer   -> draws directly to screen (visible)
- *   draw_target = back_buffer   -> draws to hidden buffer (invisible)
+ * screen_buffer is ALSO at logical resolution. when we write to it,
+ * we immediately scale to the real framebuffer so it's visible.
  */
 static uint32_t back_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
+static uint32_t screen_buffer[SCREEN_WIDTH * SCREEN_HEIGHT];
 static volatile uint32_t *draw_target;
+static int drawing_to_screen = 0;  /* 1 = draw_target is screen_buffer */
 
-/* switch drawing to the hidden back buffer */
-static void vga_use_backbuffer(void) {
-    draw_target = (volatile uint32_t *)back_buffer;
-}
-
-/* switch drawing directly to the screen */
-static void vga_use_screen(void) {
-    draw_target = framebuffer;
-}
-
-/*
- * copy the entire back buffer to the screen in one go ("flip").
- *
- * uses "rep movsl" - an x86 instruction that copies 32-bit words
- * in a tight hardware-optimized loop. the CPU knows this pattern
- * and can burst data across the memory bus much faster than a
- * C for-loop that does individual writes.
- *
- *   rep    = "repeat ECX times"
- *   movsl  = "move string long" (copy 4 bytes from ESI to EDI, advance both)
- */
-static void vga_flush(void) {
-    int count = SCREEN_WIDTH * SCREEN_HEIGHT;
-    const uint32_t *src = (const uint32_t *)back_buffer;
-    volatile uint32_t *dest = framebuffer;
+/* fast_memcpy32 - bulk copy using rep movsl (declared early, used by flush) */
+static inline void fast_memcpy32(uint32_t *dest, const uint32_t *src, int count) {
+    if (count <= 0) return;
     __asm__ volatile (
         "rep movsl"
         : "+D"(dest), "+S"(src), "+c"(count)
@@ -166,59 +127,116 @@ static void vga_flush(void) {
     );
 }
 
-/*
- * initialize 640x480x32 graphics mode using Bochs VBE.
- *
- * step 1: find framebuffer address from PCI
- * step 2: program the display resolution
- */
-static void vga_init_graphics(void) {
-    /*
-     * step 1: find the framebuffer address.
-     *
-     * the VGA card is a PCI device. its framebuffer is mapped into
-     * the CPU's memory space at an address stored in BAR 0.
-     * in QEMU, the VGA is at bus 0, device 2, function 0.
-     * BAR 0 is at PCI config offset 0x10.
-     */
-    uint32_t bar0 = pci_read(0, 2, 0, 0x10);
-    /* mask off the lower 4 bits (they're flags, not part of the address) */
-    framebuffer = (volatile uint32_t *)(bar0 & 0xFFFFFFF0);
+/* fast_memset32 - bulk fill using rep stosl */
+static inline void fast_memset32(uint32_t *dest, uint32_t val, int count) {
+    if (count <= 0) return;
+    __asm__ volatile (
+        "rep stosl"
+        : "+D"(dest), "+c"(count)
+        : "a"(val)
+        : "memory"
+    );
+}
 
-    /* default: draw directly to screen */
-    draw_target = framebuffer;
+static void vga_use_backbuffer(void) {
+    draw_target = (volatile uint32_t *)back_buffer;
+    drawing_to_screen = 0;
+}
 
-    /*
-     * step 2: set the display mode.
-     * disable VBE first, change settings, then re-enable.
-     * this is like turning off a monitor before changing its resolution.
-     */
-    vbe_write(VBE_REG_ENABLE, 0x00);             /* disable */
-    vbe_write(VBE_REG_XRES, SCREEN_WIDTH);        /* 640 pixels wide */
-    vbe_write(VBE_REG_YRES, SCREEN_HEIGHT);       /* 480 pixels tall */
-    vbe_write(VBE_REG_BPP, 32);                   /* 32 bits per pixel */
-    vbe_write(VBE_REG_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED); /* enable! */
+static void vga_use_screen(void) {
+    draw_target = (volatile uint32_t *)screen_buffer;
+    drawing_to_screen = 1;
 }
 
 /*
- * draw a single pixel at (x, y) with a 32-bit color.
- * the framebuffer is a flat array: position = y * width + x
- * each element is a uint32_t (4 bytes) = one pixel.
+ * write a 2x2 scaled pixel block to the real framebuffer.
+ * called whenever we need something to appear on screen immediately.
+ */
+static inline void fb_write_scaled(int lx, int ly, uint32_t color) {
+    if (lx < 0 || lx >= SCREEN_WIDTH || ly < 0 || ly >= SCREEN_HEIGHT) return;
+    int rx = lx * SCALE;
+    int ry = ly * SCALE;
+    framebuffer[ry * REAL_WIDTH + rx]           = color;
+    framebuffer[ry * REAL_WIDTH + rx + 1]       = color;
+    framebuffer[(ry + 1) * REAL_WIDTH + rx]     = color;
+    framebuffer[(ry + 1) * REAL_WIDTH + rx + 1] = color;
+}
+
+/*
+ * flush the back buffer to the screen with 2x scaling.
+ *
+ * each logical pixel becomes a 2x2 block of physical pixels.
+ * we process one logical row at a time, writing two physical rows.
+ */
+static void vga_flush(void) {
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        const uint32_t *src = &back_buffer[y * SCREEN_WIDTH];
+        int ry = y * SCALE;
+        volatile uint32_t *dst1 = &framebuffer[ry * REAL_WIDTH];
+        volatile uint32_t *dst2 = &framebuffer[(ry + 1) * REAL_WIDTH];
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+            uint32_t c = src[x];
+            int rx = x * SCALE;
+            dst1[rx]     = c;
+            dst1[rx + 1] = c;
+            dst2[rx]     = c;
+            dst2[rx + 1] = c;
+        }
+    }
+    /* also sync screen_buffer so direct draws stay consistent */
+    fast_memcpy32(screen_buffer, back_buffer, SCREEN_WIDTH * SCREEN_HEIGHT);
+}
+
+/*
+ * flush the screen_buffer to the real framebuffer.
+ * used after direct drawing (animation) to sync visible state.
+ */
+static void vga_flush_screen(void) {
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        const uint32_t *src = &screen_buffer[y * SCREEN_WIDTH];
+        int ry = y * SCALE;
+        volatile uint32_t *dst1 = &framebuffer[ry * REAL_WIDTH];
+        volatile uint32_t *dst2 = &framebuffer[(ry + 1) * REAL_WIDTH];
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+            uint32_t c = src[x];
+            int rx = x * SCALE;
+            dst1[rx]     = c;
+            dst1[rx + 1] = c;
+            dst2[rx]     = c;
+            dst2[rx + 1] = c;
+        }
+    }
+}
+
+/* initialize 1280x960x32 graphics mode (displayed as scaled 640x480) */
+static void vga_init_graphics(void) {
+    uint32_t bar0 = pci_read(0, 2, 0, 0x10);
+    framebuffer = (volatile uint32_t *)(bar0 & 0xFFFFFFF0);
+
+    draw_target = (volatile uint32_t *)screen_buffer;
+    drawing_to_screen = 1;
+
+    vbe_write(VBE_REG_ENABLE, 0x00);
+    vbe_write(VBE_REG_XRES, REAL_WIDTH);      /* 1280 physical pixels */
+    vbe_write(VBE_REG_YRES, REAL_HEIGHT);      /* 960 physical pixels */
+    vbe_write(VBE_REG_BPP, 32);
+    vbe_write(VBE_REG_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED);
+}
+
+/*
+ * draw a single pixel.
+ * writes to the logical buffer (640x480).
+ * if drawing to screen, also immediately scales to the real framebuffer.
  */
 static inline void vga_put_pixel(int x, int y, uint32_t color) {
     if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT) return;
     draw_target[y * SCREEN_WIDTH + x] = color;
+    if (drawing_to_screen) {
+        fb_write_scaled(x, y, color);
+    }
 }
 
-/*
- * clear the entire screen to one color.
- *
- * uses "rep stosl" - fills memory with a 32-bit value in a
- * hardware-optimized loop. way faster than writing one pixel at a time.
- *
- *   rep    = "repeat ECX times"
- *   stosl  = "store string long" (write EAX to EDI, advance EDI)
- */
+/* clear the entire logical screen */
 static void vga_clear(uint32_t color) {
     int count = SCREEN_WIDTH * SCREEN_HEIGHT;
     volatile uint32_t *dest = draw_target;
@@ -228,9 +246,20 @@ static void vga_clear(uint32_t color) {
         : "a"(color)
         : "memory"
     );
+    if (drawing_to_screen) {
+        /* also clear the real framebuffer */
+        int real_count = REAL_WIDTH * REAL_HEIGHT;
+        volatile uint32_t *fb = framebuffer;
+        __asm__ volatile (
+            "rep stosl"
+            : "+D"(fb), "+c"(real_count)
+            : "a"(color)
+            : "memory"
+        );
+    }
 }
 
-/* draw a horizontal line (uses rep stosl for speed) */
+/* draw a horizontal line */
 static void vga_draw_hline(int x, int y, int width, uint32_t color) {
     if (y < 0 || y >= SCREEN_HEIGHT) return;
     int x1 = x < 0 ? 0 : x;
@@ -244,6 +273,9 @@ static void vga_draw_hline(int x, int y, int width, uint32_t color) {
         : "a"(color)
         : "memory"
     );
+    if (drawing_to_screen) {
+        for (int px = x1; px < x2; px++) fb_write_scaled(px, y, color);
+    }
 }
 
 /* draw a vertical line */
@@ -253,20 +285,12 @@ static void vga_draw_vline(int x, int y, int height, uint32_t color) {
     int y2 = (y + height) > SCREEN_HEIGHT ? SCREEN_HEIGHT : (y + height);
     for (int row = y1; row < y2; row++) {
         draw_target[row * SCREEN_WIDTH + x] = color;
+        if (drawing_to_screen) fb_write_scaled(x, row, color);
     }
 }
 
-/*
- * draw a filled rectangle.
- *
- * OLD: called vga_put_pixel per pixel = 4 bounds checks per pixel.
- *      for a 500x432 rect that's 864,000 comparisons!
- *
- * NEW: clamp bounds ONCE, then fill each row with rep stosl.
- *      zero per-pixel overhead.
- */
+/* draw a filled rectangle */
 static void vga_fill_rect(int x, int y, int w, int h, uint32_t color) {
-    /* clamp to screen bounds once */
     int x1 = x < 0 ? 0 : x;
     int y1 = y < 0 ? 0 : y;
     int x2 = (x + w) > SCREEN_WIDTH ? SCREEN_WIDTH : (x + w);
@@ -283,6 +307,19 @@ static void vga_fill_rect(int x, int y, int w, int h, uint32_t color) {
             : "a"(color)
             : "memory"
         );
+    }
+    if (drawing_to_screen) {
+        /* scale the filled rect to real framebuffer */
+        for (int row = y1; row < y2; row++) {
+            int ry = row * SCALE;
+            for (int col = x1; col < x2; col++) {
+                int rx = col * SCALE;
+                framebuffer[ry * REAL_WIDTH + rx]           = color;
+                framebuffer[ry * REAL_WIDTH + rx + 1]       = color;
+                framebuffer[(ry + 1) * REAL_WIDTH + rx]     = color;
+                framebuffer[(ry + 1) * REAL_WIDTH + rx + 1] = color;
+            }
+        }
     }
 }
 
