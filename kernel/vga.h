@@ -36,14 +36,25 @@
 #define SCREEN_HEIGHT   480
 
 /*
- * PHYSICAL resolution - the actual VBE framebuffer size.
- * each logical pixel becomes a SCALE x SCALE block on screen.
- * this makes the window physically larger without changing the
- * pixel density or any layout code.
+ * PHYSICAL resolution presets.
+ *
+ * the logical resolution is always 640x480 -- all drawing code uses this.
+ * the physical resolution determines how big the window is.
+ * we use nearest-neighbor scaling to stretch the logical buffer to fit.
+ *
+ * Shift+R cycles through these presets.
+ * max is sized for a 16" MacBook (1728x1117 usable).
  */
-#define SCALE           2
-#define REAL_WIDTH      (SCREEN_WIDTH * SCALE)
-#define REAL_HEIGHT     (SCREEN_HEIGHT * SCALE)
+#define NUM_SCALES 4
+static const int scale_widths[NUM_SCALES]  = { 640, 960, 1280, 1728 };
+static const int scale_heights[NUM_SCALES] = { 480, 720,  960, 1117 };
+static int scale_index = 2;  /* default: 1280x960 */
+
+static int real_width  = 1280;
+static int real_height = 960;
+
+/* kept for compatibility with code that reads current_scale */
+static int current_scale = 2;
 
 /* === Bochs VBE register interface === */
 #define VBE_INDEX_PORT   0x01CE
@@ -149,38 +160,42 @@ static void vga_use_screen(void) {
 }
 
 /*
- * write a 2x2 scaled pixel block to the real framebuffer.
- * called whenever we need something to appear on screen immediately.
+ * write a scaled pixel block to the real framebuffer.
+ *
+ * for a logical pixel (lx, ly), we compute the physical pixel range
+ * it maps to and fill all of them. this works for any resolution,
+ * including non-integer scales like 1728x1117 from 640x480.
+ *
+ * the math: logical pixel lx maps to physical x range:
+ *   [lx * real_width / SCREEN_WIDTH, (lx+1) * real_width / SCREEN_WIDTH)
  */
 static inline void fb_write_scaled(int lx, int ly, uint32_t color) {
     if (lx < 0 || lx >= SCREEN_WIDTH || ly < 0 || ly >= SCREEN_HEIGHT) return;
-    int rx = lx * SCALE;
-    int ry = ly * SCALE;
-    framebuffer[ry * REAL_WIDTH + rx]           = color;
-    framebuffer[ry * REAL_WIDTH + rx + 1]       = color;
-    framebuffer[(ry + 1) * REAL_WIDTH + rx]     = color;
-    framebuffer[(ry + 1) * REAL_WIDTH + rx + 1] = color;
+    int rx0 = lx * real_width / SCREEN_WIDTH;
+    int rx1 = (lx + 1) * real_width / SCREEN_WIDTH;
+    int ry0 = ly * real_height / SCREEN_HEIGHT;
+    int ry1 = (ly + 1) * real_height / SCREEN_HEIGHT;
+    for (int ry = ry0; ry < ry1; ry++) {
+        for (int rx = rx0; rx < rx1; rx++) {
+            framebuffer[ry * real_width + rx] = color;
+        }
+    }
 }
 
 /*
- * flush the back buffer to the screen with 2x scaling.
+ * flush the back buffer to the screen with nearest-neighbor scaling.
  *
- * each logical pixel becomes a 2x2 block of physical pixels.
- * we process one logical row at a time, writing two physical rows.
+ * for each physical pixel, we look up which logical pixel it maps to.
+ * this works for any physical resolution, even non-integer scales.
  */
 static void vga_flush(void) {
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        const uint32_t *src = &back_buffer[y * SCREEN_WIDTH];
-        int ry = y * SCALE;
-        volatile uint32_t *dst1 = &framebuffer[ry * REAL_WIDTH];
-        volatile uint32_t *dst2 = &framebuffer[(ry + 1) * REAL_WIDTH];
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            uint32_t c = src[x];
-            int rx = x * SCALE;
-            dst1[rx]     = c;
-            dst1[rx + 1] = c;
-            dst2[rx]     = c;
-            dst2[rx + 1] = c;
+    for (int ry = 0; ry < real_height; ry++) {
+        int ly = ry * SCREEN_HEIGHT / real_height;
+        const uint32_t *src_row = &back_buffer[ly * SCREEN_WIDTH];
+        volatile uint32_t *dst_row = &framebuffer[ry * real_width];
+        for (int rx = 0; rx < real_width; rx++) {
+            int lx = rx * SCREEN_WIDTH / real_width;
+            dst_row[rx] = src_row[lx];
         }
     }
     /* also sync screen_buffer so direct draws stay consistent */
@@ -192,23 +207,18 @@ static void vga_flush(void) {
  * used after direct drawing (animation) to sync visible state.
  */
 static void vga_flush_screen(void) {
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        const uint32_t *src = &screen_buffer[y * SCREEN_WIDTH];
-        int ry = y * SCALE;
-        volatile uint32_t *dst1 = &framebuffer[ry * REAL_WIDTH];
-        volatile uint32_t *dst2 = &framebuffer[(ry + 1) * REAL_WIDTH];
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            uint32_t c = src[x];
-            int rx = x * SCALE;
-            dst1[rx]     = c;
-            dst1[rx + 1] = c;
-            dst2[rx]     = c;
-            dst2[rx + 1] = c;
+    for (int ry = 0; ry < real_height; ry++) {
+        int ly = ry * SCREEN_HEIGHT / real_height;
+        const uint32_t *src_row = &screen_buffer[ly * SCREEN_WIDTH];
+        volatile uint32_t *dst_row = &framebuffer[ry * real_width];
+        for (int rx = 0; rx < real_width; rx++) {
+            int lx = rx * SCREEN_WIDTH / real_width;
+            dst_row[rx] = src_row[lx];
         }
     }
 }
 
-/* initialize 1280x960x32 graphics mode (displayed as scaled 640x480) */
+/* initialize graphics mode at the current preset resolution */
 static void vga_init_graphics(void) {
     uint32_t bar0 = pci_read(0, 2, 0, 0x10);
     framebuffer = (volatile uint32_t *)(bar0 & 0xFFFFFFF0);
@@ -216,9 +226,33 @@ static void vga_init_graphics(void) {
     draw_target = (volatile uint32_t *)screen_buffer;
     drawing_to_screen = 1;
 
+    real_width  = scale_widths[scale_index];
+    real_height = scale_heights[scale_index];
+    current_scale = real_width / SCREEN_WIDTH;
+
     vbe_write(VBE_REG_ENABLE, 0x00);
-    vbe_write(VBE_REG_XRES, REAL_WIDTH);      /* 1280 physical pixels */
-    vbe_write(VBE_REG_YRES, REAL_HEIGHT);      /* 960 physical pixels */
+    vbe_write(VBE_REG_XRES, real_width);
+    vbe_write(VBE_REG_YRES, real_height);
+    vbe_write(VBE_REG_BPP, 32);
+    vbe_write(VBE_REG_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED);
+}
+
+/*
+ * change the display resolution at runtime.
+ * cycles through presets: 640x480 -> 960x720 -> 1280x960 -> 1728x1117.
+ * reinitializes the VBE display with the new physical resolution.
+ */
+static void vga_set_scale(int new_index) {
+    if (new_index < 0) new_index = 0;
+    if (new_index >= NUM_SCALES) new_index = NUM_SCALES - 1;
+    scale_index = new_index;
+    real_width  = scale_widths[scale_index];
+    real_height = scale_heights[scale_index];
+    current_scale = real_width / SCREEN_WIDTH;  /* approximate, for display */
+
+    vbe_write(VBE_REG_ENABLE, 0x00);
+    vbe_write(VBE_REG_XRES, real_width);
+    vbe_write(VBE_REG_YRES, real_height);
     vbe_write(VBE_REG_BPP, 32);
     vbe_write(VBE_REG_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED);
 }
@@ -248,7 +282,7 @@ static void vga_clear(uint32_t color) {
     );
     if (drawing_to_screen) {
         /* also clear the real framebuffer */
-        int real_count = REAL_WIDTH * REAL_HEIGHT;
+        int real_count = real_width * real_height;
         volatile uint32_t *fb = framebuffer;
         __asm__ volatile (
             "rep stosl"
@@ -311,13 +345,8 @@ static void vga_fill_rect(int x, int y, int w, int h, uint32_t color) {
     if (drawing_to_screen) {
         /* scale the filled rect to real framebuffer */
         for (int row = y1; row < y2; row++) {
-            int ry = row * SCALE;
             for (int col = x1; col < x2; col++) {
-                int rx = col * SCALE;
-                framebuffer[ry * REAL_WIDTH + rx]           = color;
-                framebuffer[ry * REAL_WIDTH + rx + 1]       = color;
-                framebuffer[(ry + 1) * REAL_WIDTH + rx]     = color;
-                framebuffer[(ry + 1) * REAL_WIDTH + rx + 1] = color;
+                fb_write_scaled(col, row, color);
             }
         }
     }

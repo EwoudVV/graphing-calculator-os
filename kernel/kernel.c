@@ -78,6 +78,41 @@ typedef struct {
 static equation_slot equations[MAX_EQUATIONS];
 static int eq_count = 0;
 
+/*
+ * plotted points - individual (x,y) markers on the graph.
+ * these are different from equations: no curve, just a dot.
+ * type "(5,1)" in the input bar to place one.
+ */
+#define MAX_POINTS 12
+
+typedef struct {
+    float x, y;
+    char text[MAX_EQ_LEN + 1];  /* original text for panel display */
+} plot_point;
+
+static plot_point points[MAX_POINTS];
+static int point_count = 0;
+
+/*
+ * drawn lines - lines between two points on the graph.
+ * click two points on the graph to draw a line between them.
+ * the line extends infinitely in both directions (like a math line).
+ */
+#define MAX_LINES 6
+
+typedef struct {
+    float x1, y1, x2, y2;  /* math coordinates of the two defining points */
+} drawn_line;
+
+static drawn_line lines[MAX_LINES];
+static int line_count = 0;
+
+/* state for click-to-draw-line: first click stored here */
+static int line_first_click = 0;   /* 1 = waiting for second click */
+static float line_click_x = 0;
+static float line_click_y = 0;
+static int right_was_pressed = 0;  /* debounce right-click */
+
 /* graph colors for each equation slot */
 static const uint32_t eq_colors[MAX_EQUATIONS] = {
     COLOR_LIGHT_GREEN,
@@ -788,6 +823,161 @@ static void draw_intersection_markers(void) {
     }
 }
 
+/*
+ * try_parse_point - check if input is a point like "(5,1)" or "(-3, 2.5)"
+ *
+ * Returns 1 and fills out_x/out_y if the input matches point syntax.
+ * Returns 0 if it's not a point (so we fall through to equation parsing).
+ */
+static int try_parse_point(const char *buf, float *out_x, float *out_y) {
+    const char *s = buf;
+    while (*s == ' ') s++;
+    if (*s != '(') return 0;
+    s++;
+    while (*s == ' ') s++;
+
+    /* parse x coordinate (may be negative) */
+    int neg_x = 0;
+    if (*s == '-') { neg_x = 1; s++; }
+    if (!is_digit(*s) && *s != '.') return 0;
+    float px = parse_number(&s);
+    if (neg_x) px = -px;
+
+    while (*s == ' ') s++;
+    if (*s != ',') return 0;
+    s++;
+    while (*s == ' ') s++;
+
+    /* parse y coordinate (may be negative) */
+    int neg_y = 0;
+    if (*s == '-') { neg_y = 1; s++; }
+    if (!is_digit(*s) && *s != '.') return 0;
+    float py = parse_number(&s);
+    if (neg_y) py = -py;
+
+    while (*s == ' ') s++;
+    if (*s != ')') return 0;
+
+    *out_x = px;
+    *out_y = py;
+    return 1;
+}
+
+/*
+ * draw_point_markers - draw all user-placed points on the graph.
+ *
+ * Each point is a filled circle (radius 4) at its math coordinates,
+ * with a white center dot so it's visible against any background.
+ */
+static void draw_point_markers(void) {
+    for (int i = 0; i < point_count; i++) {
+        int px = origin_x + (int)(points[i].x * (float)grid_scale);
+        int py = origin_y - (int)(points[i].y * (float)grid_scale);
+
+        /* skip if off screen */
+        if (px < GRAPH_LEFT - 5 || px > GRAPH_RIGHT + 5 ||
+            py < GRAPH_TOP - 5  || py > GRAPH_BOTTOM + 5) continue;
+
+        uint32_t color = eq_colors[i % MAX_EQUATIONS];
+
+        /* filled circle, radius 4 */
+        for (int dy = -4; dy <= 4; dy++) {
+            for (int dx = -4; dx <= 4; dx++) {
+                if (dx*dx + dy*dy <= 16) {
+                    int ppx = px + dx, ppy = py + dy;
+                    if (ppx >= GRAPH_LEFT && ppx <= GRAPH_RIGHT &&
+                        ppy >= GRAPH_TOP && ppy <= GRAPH_BOTTOM)
+                        vga_put_pixel(ppx, ppy, color);
+                }
+            }
+        }
+        /* white center dot */
+        if (px >= GRAPH_LEFT && px <= GRAPH_RIGHT &&
+            py >= GRAPH_TOP && py <= GRAPH_BOTTOM)
+            vga_put_pixel(px, py, COLOR_WHITE);
+    }
+}
+
+/*
+ * draw_user_lines - draw all user-placed lines on the graph.
+ *
+ * each line is defined by two points but drawn as an infinite line
+ * (extending to the edges of the graph). we compute the line equation
+ * from the two points and draw it across the full graph width.
+ *
+ * math: given points (x1,y1) and (x2,y2):
+ *   slope = (y2-y1) / (x2-x1)
+ *   y = y1 + slope * (x - x1)
+ * for vertical lines (x1 == x2), we draw a vertical line.
+ */
+static void draw_user_lines(void) {
+    for (int i = 0; i < line_count; i++) {
+        uint32_t color = eq_colors[(eq_count + point_count + i) % MAX_EQUATIONS];
+        float x1 = lines[i].x1, y1 = lines[i].y1;
+        float x2 = lines[i].x2, y2 = lines[i].y2;
+
+        float dx = x2 - x1;
+        float dy = y2 - y1;
+
+        if (dx == 0 && dy == 0) continue; /* degenerate: same point */
+
+        int prev_py = -1;
+
+        if (my_abs(dx) < 0.0001f) {
+            /* nearly vertical line */
+            int px = origin_x + (int)(x1 * (float)grid_scale);
+            if (px >= GRAPH_LEFT && px <= GRAPH_RIGHT) {
+                for (int py = GRAPH_TOP; py <= GRAPH_BOTTOM; py++) {
+                    vga_put_pixel(px, py, color);
+                }
+            }
+        } else {
+            /* normal line: compute y for each pixel column */
+            float slope = dy / dx;
+            for (int px = GRAPH_LEFT; px <= GRAPH_RIGHT; px++) {
+                float mx = (float)(px - origin_x) / (float)grid_scale;
+                float my = y1 + slope * (mx - x1);
+                int py = origin_y - (int)(my * (float)grid_scale);
+
+                if (py >= GRAPH_TOP && py <= GRAPH_BOTTOM) {
+                    vga_put_pixel(px, py, color);
+                    /* connect with previous pixel to avoid gaps */
+                    if (prev_py >= GRAPH_TOP && prev_py <= GRAPH_BOTTOM && prev_py != -1) {
+                        int ys = (prev_py < py) ? prev_py : py;
+                        int ye = (prev_py < py) ? py : prev_py;
+                        if (ye - ys < GRAPH_HEIGHT / 2) {
+                            for (int y = ys; y <= ye; y++)
+                                vga_put_pixel(px, y, color);
+                        }
+                    }
+                }
+                prev_py = py;
+            }
+        }
+
+        /* draw the two defining points as small dots */
+        for (int p = 0; p < 2; p++) {
+            float ptx = (p == 0) ? x1 : x2;
+            float pty = (p == 0) ? y1 : y2;
+            int ppx = origin_x + (int)(ptx * (float)grid_scale);
+            int ppy = origin_y - (int)(pty * (float)grid_scale);
+            for (int ddy = -3; ddy <= 3; ddy++) {
+                for (int ddx = -3; ddx <= 3; ddx++) {
+                    if (ddx*ddx + ddy*ddy <= 9) {
+                        int fx = ppx + ddx, fy = ppy + ddy;
+                        if (fx >= GRAPH_LEFT && fx <= GRAPH_RIGHT &&
+                            fy >= GRAPH_TOP && fy <= GRAPH_BOTTOM)
+                            vga_put_pixel(fx, fy, color);
+                    }
+                }
+            }
+            if (ppx >= GRAPH_LEFT && ppx <= GRAPH_RIGHT &&
+                ppy >= GRAPH_TOP && ppy <= GRAPH_BOTTOM)
+                vga_put_pixel(ppx, ppy, COLOR_WHITE);
+        }
+    }
+}
+
 /* === UI drawing functions === */
 
 /* draw the side panel showing all equations */
@@ -818,8 +1008,41 @@ static void draw_panel(void) {
         draw_string(42, y, display, eq_colors[i]);
     }
 
+    /* draw plotted points below equations */
+    for (int i = 0; i < point_count; i++) {
+        int y = 28 + (eq_count + i) * 20;
+        uint32_t color = eq_colors[i % MAX_EQUATIONS];
+
+        /* color indicator dot (circle-ish) */
+        vga_fill_rect(9, y + 3, 4, 4, color);
+
+        /* point text (truncated to fit panel) */
+        char display[14];
+        int j;
+        for (j = 0; j < 13 && points[i].text[j]; j++) {
+            display[j] = points[i].text[j];
+        }
+        display[j] = '\0';
+        draw_string(18, y, display, color);
+    }
+
+    /* draw lines below points */
+    for (int i = 0; i < line_count; i++) {
+        int y = 28 + (eq_count + point_count + i) * 20;
+        uint32_t color = eq_colors[(eq_count + point_count + i) % MAX_EQUATIONS];
+
+        /* color indicator (small line) */
+        vga_draw_hline(8, y + 4, 6, color);
+
+        /* line label */
+        char lbl[16] = "line ";
+        lbl[5] = '0' + (i + 1);
+        lbl[6] = '\0';
+        draw_string(18, y, lbl, color);
+    }
+
     /* show instructions at bottom of panel */
-    int help_y = SCREEN_HEIGHT - 210;
+    int help_y = SCREEN_HEIGHT - 238;
     draw_string(8, help_y,       "Controls:", COLOR_GRAY);
     draw_string(8, help_y + 12,  "arrows: pan", COLOR_GRAY);
     draw_string(8, help_y + 24,  "[ ] zoom", COLOR_GRAY);
@@ -827,21 +1050,34 @@ static void draw_panel(void) {
     draw_string(8, help_y + 48,  "Tab: clear all", COLOR_GRAY);
     draw_string(8, help_y + 60,  "click eq: del", COLOR_GRAY);
     draw_string(8, help_y + 72,  "drag: pan", COLOR_GRAY);
-    draw_string(8, help_y + 88,  "Trace mode:", COLOR_LIGHT_CYAN);
-    draw_string(8, help_y + 100, "Shift+T start", COLOR_GRAY);
-    draw_string(8, help_y + 112, "mouse: trace", COLOR_GRAY);
-    draw_string(8, help_y + 124, "U/D switch eq", COLOR_GRAY);
-    draw_string(8, help_y + 136, "Shift+D tang.", COLOR_GRAY);
-    draw_string(8, help_y + 148, "Shift+F deriv.", COLOR_GRAY);
+    draw_string(8, help_y + 84,  "R-click: line", COLOR_GRAY);
+    draw_string(8, help_y + 100, "Trace mode:", COLOR_LIGHT_CYAN);
+    draw_string(8, help_y + 112, "Shift+T start", COLOR_GRAY);
+    draw_string(8, help_y + 124, "mouse: trace", COLOR_GRAY);
+    draw_string(8, help_y + 136, "U/D switch eq", COLOR_GRAY);
+    draw_string(8, help_y + 148, "Shift+D tang.", COLOR_GRAY);
+    draw_string(8, help_y + 160, "Shift+F deriv.", COLOR_GRAY);
+    draw_string(8, help_y + 172, "Shift+R scale", COLOR_GRAY);
 
-    /* show current zoom level below the instructions */
+    /* show current zoom and scale below the instructions */
     char zoom_str[16] = "zoom: ";
     char zoom_num[8];
     int_to_str(grid_scale, zoom_num);
     int zi = 6;
     for (int i = 0; zoom_num[i] && zi < 15; i++) zoom_str[zi++] = zoom_num[i];
     zoom_str[zi] = '\0';
-    draw_string(8, help_y + 168, zoom_str, COLOR_GRAY);
+    draw_string(8, help_y + 192, zoom_str, COLOR_GRAY);
+
+    char scale_str[20];
+    int si = 0;
+    char w_str[8], h_str[8];
+    int_to_str(real_width, w_str);
+    int_to_str(real_height, h_str);
+    for (int i = 0; w_str[i]; i++) scale_str[si++] = w_str[i];
+    scale_str[si++] = 'x';
+    for (int i = 0; h_str[i]; i++) scale_str[si++] = h_str[i];
+    scale_str[si] = '\0';
+    draw_string(8, help_y + 204, scale_str, COLOR_GRAY);
 }
 
 /*
@@ -1304,6 +1540,8 @@ static void redraw_all(void) {
     /* 4. mark zeros (x-axis crossings) and intersections */
     draw_zero_markers();
     draw_intersection_markers();
+    draw_point_markers();
+    draw_user_lines();
 
     /* if trace mode is on, redraw the tangent line and trace dot on the buffer */
     if (trace_mode) {
@@ -1351,6 +1589,8 @@ static void redraw_trace(void) {
     /* 2b. zero and intersection markers */
     draw_zero_markers();
     draw_intersection_markers();
+    draw_point_markers();
+    draw_user_lines();
 
     /* 3. draw trace visuals */
     if (tangent_visible) {
@@ -1429,6 +1669,8 @@ static void pan_redraw(int dx, int dy) {
     /* 4b. zero and intersection markers */
     draw_zero_markers();
     draw_intersection_markers();
+    draw_point_markers();
+    draw_user_lines();
 
     if (trace_mode) {
         if (tangent_visible) draw_tangent_line();
@@ -1614,16 +1856,16 @@ void kmain(void) {
                         int click_x = drag_start_x;
                         int click_y = drag_start_y;
 
-                        if (click_x < PANEL_WIDTH && click_y >= 28 && click_y < 28 + eq_count * 20) {
-                            int clicked_eq = (click_y - 28) / 20;
-                            if (clicked_eq >= 0 && clicked_eq < eq_count) {
-                                /* remove this equation by shifting everything down */
-                                for (int k = clicked_eq; k < eq_count - 1; k++) {
+                        if (click_x < PANEL_WIDTH && click_y >= 28) {
+                            int clicked_idx = (click_y - 28) / 20;
+
+                            if (clicked_idx >= 0 && clicked_idx < eq_count) {
+                                /* clicked on an equation - remove it */
+                                for (int k = clicked_idx; k < eq_count - 1; k++) {
                                     equations[k] = equations[k + 1];
                                 }
                                 eq_count--;
 
-                                /* if we deleted the traced equation, exit trace */
                                 if (trace_mode) {
                                     if (eq_count == 0) {
                                         trace_mode = 0;
@@ -1635,6 +1877,28 @@ void kmain(void) {
 
                                 redraw_all();
                                 restore_input_bar(input_len, input_buf);
+                            } else if (clicked_idx >= eq_count &&
+                                       clicked_idx < eq_count + point_count) {
+                                /* clicked on a point - remove it */
+                                int pt_idx = clicked_idx - eq_count;
+                                for (int k = pt_idx; k < point_count - 1; k++) {
+                                    points[k] = points[k + 1];
+                                }
+                                point_count--;
+
+                                redraw_all();
+                                restore_input_bar(input_len, input_buf);
+                            } else if (clicked_idx >= eq_count + point_count &&
+                                       clicked_idx < eq_count + point_count + line_count) {
+                                /* clicked on a line - remove it */
+                                int ln_idx = clicked_idx - eq_count - point_count;
+                                for (int k = ln_idx; k < line_count - 1; k++) {
+                                    lines[k] = lines[k + 1];
+                                }
+                                line_count--;
+
+                                redraw_all();
+                                restore_input_bar(input_len, input_buf);
                             }
                         }
                     }
@@ -1643,21 +1907,70 @@ void kmain(void) {
             }
 
             /*
+             * RIGHT-CLICK: place line endpoints on the graph.
+             *
+             * first right-click: store the first point, show a marker.
+             * second right-click: create a line between the two points.
+             * the line extends across the full graph (infinite line).
+             *
+             * we detect right-click as: right button is currently pressed
+             * and we weren't already tracking a right-click hold.
+             */
+            if (mouse.right && mouse.x >= GRAPH_LEFT && mouse.x <= GRAPH_RIGHT &&
+                mouse.y >= GRAPH_TOP && mouse.y <= GRAPH_BOTTOM && !trace_mode) {
+                if (!right_was_pressed) {
+                    right_was_pressed = 1;
+
+                    /* convert pixel to math coords */
+                    float mx = (float)(mouse.x - origin_x) / (float)grid_scale;
+                    float my_val = (float)(origin_y - mouse.y) / (float)grid_scale;
+
+                    /* snap to nearest 0.5 for cleaner lines */
+                    mx = (float)(int)(mx * 2.0f + (mx >= 0 ? 0.5f : -0.5f)) / 2.0f;
+                    my_val = (float)(int)(my_val * 2.0f + (my_val >= 0 ? 0.5f : -0.5f)) / 2.0f;
+
+                    if (!line_first_click) {
+                        /* first click: remember this point */
+                        line_first_click = 1;
+                        line_click_x = mx;
+                        line_click_y = my_val;
+
+                        /* show info in title bar */
+                        char info[40];
+                        int p = 0;
+                        info[p++] = 'L'; info[p++] = 'i'; info[p++] = 'n';
+                        info[p++] = 'e'; info[p++] = ':'; info[p++] = ' ';
+                        info[p++] = '(';
+                        char nb[16];
+                        float_to_str(mx, nb);
+                        for (int i = 0; nb[i] && p < 30; i++) info[p++] = nb[i];
+                        info[p++] = ',';
+                        float_to_str(my_val, nb);
+                        for (int i = 0; nb[i] && p < 38; i++) info[p++] = nb[i];
+                        info[p++] = ')';
+                        info[p] = '\0';
+                        update_title_bar_info(info, COLOR_YELLOW);
+                    } else if (line_count < MAX_LINES) {
+                        /* second click: create the line */
+                        lines[line_count].x1 = line_click_x;
+                        lines[line_count].y1 = line_click_y;
+                        lines[line_count].x2 = mx;
+                        lines[line_count].y2 = my_val;
+                        line_count++;
+                        line_first_click = 0;
+
+                        redraw_all();
+                        restore_input_bar(input_len, input_buf);
+                    }
+                }
+            } else if (!mouse.right) {
+                right_was_pressed = 0;
+            }
+
+            /*
              * TRACE MODE: snap trace point to the curve at the mouse's X.
-             * the mouse controls WHERE on the curve you're looking,
-             * and the trace dot snaps to the nearest point on the curve.
-             * for implicit curves (circles etc), we use the mouse Y
-             * as a hint so it follows the branch you're closest to.
-             *
-             * if there's no curve at the exact mouse X, we search nearby
-             * columns (up to 30px away) so the trace always stays connected.
-             *
-             * we only trigger a redraw when the trace point moves by at
-             * least 3 pixels, to avoid excessive redraws on tiny movements.
              */
             if (trace_mode && mouse.x >= GRAPH_LEFT && mouse.x <= GRAPH_RIGHT) {
-                int old_px = trace_px;
-                int old_py = trace_py;
                 int want_px = mouse.x;
                 /* use mouse Y as hint for implicit curve branch selection */
                 trace_py = mouse.y;
@@ -1700,12 +2013,7 @@ void kmain(void) {
                     }
                 }
 
-                /* only redraw if trace moved enough to be worth it (3+ px) */
-                int dpx = trace_px - old_px;
-                int dpy = trace_py - old_py;
-                if (dpx < 0) dpx = -dpx;
-                if (dpy < 0) dpy = -dpy;
-                if (found && (dpx >= 3 || dpy >= 3)) {
+                if (found) {
                     redraw_trace();  /* fast! skips curve recomputation */
                     restore_input_bar(input_len, input_buf);
                 }
@@ -1731,6 +2039,22 @@ void kmain(void) {
 
         /* erase cursor before any redraws to avoid leaving artifacts */
         restore_cursor();
+
+        /* --- Shift+R: cycle display scale (1x -> 2x -> 3x) ---
+         *
+         * changes the physical window size without changing the logical
+         * resolution. all drawing code stays the same, just the scaling
+         * factor when copying to the real framebuffer changes.
+         */
+        if (key == 'R') {
+            int new_idx = scale_index + 1;
+            if (new_idx >= NUM_SCALES) new_idx = 0;
+            vga_set_scale(new_idx);
+            redraw_all();
+            restore_input_bar(input_len, input_buf);
+            draw_mouse_cursor(mouse.x, mouse.y);
+            continue;
+        }
 
         /* --- Shift+T: toggle trace mode ---
          *
@@ -1875,6 +2199,9 @@ void kmain(void) {
         /* --- tab key: clear all equations --- */
         if (key == '\t') {
             eq_count = 0;
+            point_count = 0;
+            line_count = 0;
+            line_first_click = 0;
             trace_mode = 0;
             tangent_visible = 0;
             curve_layer_clear();
@@ -1899,7 +2226,27 @@ void kmain(void) {
                 draw_cursor(input_len, COLOR_WHITE);
             }
         } else if (key == '\n') {
-            if (input_len > 0 && eq_count < MAX_EQUATIONS) {
+            /* check if it's a point like (5,1) before trying equation */
+            float pt_x, pt_y;
+            if (input_len > 0 && point_count < MAX_POINTS &&
+                try_parse_point(input_buf, &pt_x, &pt_y)) {
+                points[point_count].x = pt_x;
+                points[point_count].y = pt_y;
+                /* store original text for panel display */
+                for (int i = 0; i <= input_len; i++)
+                    points[point_count].text[i] = input_buf[i];
+                point_count++;
+
+                redraw_all();
+                restore_input_bar(input_len, input_buf);
+
+                /* clear input */
+                draw_cursor(input_len, COLOR_INPUT_BG);
+                input_len = 0;
+                input_buf[0] = '\0';
+                clear_input_text();
+                draw_cursor(0, COLOR_WHITE);
+            } else if (input_len > 0 && eq_count < MAX_EQUATIONS) {
                 /* copy input text to equation slot */
                 equation_slot *slot = &equations[eq_count];
                 for (int i = 0; i <= input_len; i++) {
